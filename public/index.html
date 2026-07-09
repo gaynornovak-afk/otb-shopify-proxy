@@ -194,6 +194,8 @@ function OTBEngine() {
   const [importText, setImportText] = useState("");
   const [importPreview, setImportPreview] = useState(null);
   const [importError, setImportError] = useState("");
+  const [importFormat, setImportFormat] = useState("generic");
+  const [importSummary, setImportSummary] = useState("");
   const fileInputRef = useRef(null);
   const visibleMonths = 6;
 
@@ -298,9 +300,16 @@ function OTBEngine() {
       header: true, skipEmptyLines: true,
       complete: (res) => {
         const cols = res.meta.fields || [];
+        const isPOFormat = cols.includes("Product Type") && cols.includes("Total Cost Ordered") && cols.includes("Total Cost Received");
+        if (isPOFormat) {
+          setImportFormat("po");
+          setImportPreview(res.data.slice(0, 5000));
+          return;
+        }
+        setImportFormat("generic");
         const required = ["Product Type", "Month"];
         const missing = required.filter((r) => !cols.includes(r));
-        if (missing.length) { setImportError(`Missing required column(s): ${missing.join(", ")}.`); setImportPreview(null); return; }
+        if (missing.length) { setImportError(`Missing required column(s): ${missing.join(", ")}. (For a PO/receiving export, include "Total Cost Ordered" and "Total Cost Received" columns instead.)`); setImportPreview(null); return; }
         setImportPreview(res.data.slice(0, 2000));
       },
       error: (err) => { setImportError("Could not parse that CSV: " + err.message); setImportPreview(null); },
@@ -308,6 +317,7 @@ function OTBEngine() {
   }
   function applyImport() {
     if (!importPreview) return;
+    if (importFormat === "po") { applyPOImport(); return; }
     const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
     setData((prev) => {
       const next = { ...prev };
@@ -328,6 +338,50 @@ function OTBEngine() {
       });
       return next;
     });
+    setShowImport(false); setImportText(""); setImportPreview(null);
+  }
+  // Aggregates a line-item PO/receiving export (Product Type, Expected Date, Received Date,
+  // Total Cost Ordered, Total Cost Received) into Received $ / Balance to Receive $ per
+  // product type per month. Re-importing overwrites those two fields with freshly computed
+  // totals for that type+month (not additive), so it's safe to re-run with an updated export.
+  function applyPOImport() {
+    const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
+    const monthOf = (dateStr) => { const s = (dateStr || "").trim(); return /^\d{4}-\d{2}/.test(s) ? s.slice(0, 7) : null; };
+    const totals = {}; // type -> month -> { received, balance }
+    let matchedRows = 0;
+    importPreview.forEach((r) => {
+      const typeName = (r["Product Type"] || "").trim();
+      if (!typeName || !validTypes.has(typeName.toLowerCase())) return;
+      const match = TAXONOMY.find((t) => t[0].toLowerCase() === typeName.toLowerCase())[0];
+      const ordered = Number(r["Total Cost Ordered"]) || 0;
+      const received = Number(r["Total Cost Received"]) || 0;
+      const balance = Math.max(0, ordered - received);
+      const receivedMonth = monthOf(r["Received Date"]);
+      const expectedMonth = monthOf(r["Expected Date"]) || receivedMonth || months[monthCursor];
+      matchedRows++;
+      totals[match] = totals[match] || {};
+      if (received > 0 && receivedMonth) {
+        totals[match][receivedMonth] = totals[match][receivedMonth] || { received: 0, balance: 0 };
+        totals[match][receivedMonth].received += received;
+      }
+      if (balance > 0.005) {
+        totals[match][expectedMonth] = totals[match][expectedMonth] || { received: 0, balance: 0 };
+        totals[match][expectedMonth].balance += balance;
+      }
+    });
+    setData((prev) => {
+      const next = { ...prev };
+      Object.entries(totals).forEach(([type, byMonth]) => {
+        const typeData = { ...(next[type] || {}) };
+        Object.entries(byMonth).forEach(([mKey, vals]) => {
+          const existing = typeData[mKey] || emptyRow();
+          typeData[mKey] = { ...existing, received: Number(vals.received.toFixed(2)), balanceToReceive: Number(vals.balance.toFixed(2)) };
+        });
+        next[type] = typeData;
+      });
+      return next;
+    });
+    setImportSummary(`Applied ${matchedRows} line items across ${Object.keys(totals).length} product types.`);
     setShowImport(false); setImportText(""); setImportPreview(null);
   }
   function handleFileUpload(e) {
@@ -610,22 +664,33 @@ function OTBEngine() {
       )}
 
       {showImport && (
-        <Modal onClose={() => { setShowImport(false); setImportPreview(null); setImportError(""); }} title="Import actuals from CSV">
-          <p className="text-sm mb-3" style={{ color: "#5C6270" }}>Expected columns (Product Type must exactly match your Shopify Type field):</p>
-          <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
-            Product Type, Month, LY Sales, LY COGS, Actual Sales, Actual COGS, Received, Balance to Receive, Target BOM Override, Actual BOM Override
+        <Modal onClose={() => { setShowImport(false); setImportPreview(null); setImportError(""); }} title="Import from CSV">
+          <p className="text-sm mb-2" style={{ color: "#5C6270" }}>Two formats are auto-detected from the column headers:</p>
+          <div className="text-xs mb-2 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
+            <b>Actuals/plan:</b> Product Type, Month, LY Sales, LY COGS, Actual Sales, Actual COGS, Received, Balance to Receive
           </div>
+          <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
+            <b>PO/receiving export</b> (e.g. from your "PO Export" Sidekick app): Product Type, Expected Date, Received Date, Total Cost Ordered, Total Cost Received — this one auto-fills Received $ and Balance to Receive $ by month.
+          </div>
+          {importSummary && <div className="text-xs mb-3 p-2 rounded" style={{ background: "#EDF3EA", color: "#5B7A5B" }}>{importSummary}</div>}
           <div className="flex gap-2 mb-3">
             <button onClick={() => fileInputRef.current?.click()} className="text-xs px-3 py-1.5 rounded flex items-center gap-1" style={{ background: "#20232B", color: "#F1EEE6" }}>
               <Icon.upload /> Upload CSV file
             </button>
             <input ref={fileInputRef} type="file" accept=".csv" className="hidden" onChange={handleFileUpload} />
           </div>
-          <textarea value={importText} onChange={(e) => { setImportText(e.target.value); parseAndPreview(e.target.value); }} placeholder="Product Type,Month,LY Sales,LY COGS,Actual Sales,Actual COGS,Received,Balance to Receive" className="w-full h-28 text-xs p-2 rounded border font-mono" style={{ borderColor: "#DCD5C4" }} />
+          <textarea value={importText} onChange={(e) => { setImportText(e.target.value); parseAndPreview(e.target.value); }} placeholder="Paste CSV here, or upload a file above" className="w-full h-24 text-xs p-2 rounded border font-mono" style={{ borderColor: "#DCD5C4" }} />
           {importError && <div className="text-xs mt-2" style={{ color: "#B5432D" }}>{importError}</div>}
           {importPreview && (
             <div className="mt-3 text-xs max-h-40 overflow-y-auto border rounded p-2" style={{ borderColor: "#DCD5C4" }}>
-              {importPreview.slice(0, 8).map((r, i) => (<div key={i} style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{r["Product Type"]} · {r["Month"]}</div>))}
+              <div className="mb-1" style={{ color: "#8C6E4A", fontWeight: 600 }}>Detected format: {importFormat === "po" ? "PO/receiving export" : "Actuals/plan"} ({importPreview.length} rows)</div>
+              {importPreview.slice(0, 8).map((r, i) => (
+                <div key={i} style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
+                  {importFormat === "po"
+                    ? `${r["Product Type"]} · ordered ${r["Total Cost Ordered"]} · received ${r["Total Cost Received"]}`
+                    : `${r["Product Type"]} · ${r["Month"]}`}
+                </div>
+              ))}
               {importPreview.length > 8 && <div style={{ color: "#8B8F98" }}>…and {importPreview.length - 8} more rows</div>}
             </div>
           )}
