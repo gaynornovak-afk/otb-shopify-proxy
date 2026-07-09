@@ -201,19 +201,21 @@ function OTBEngine() {
 
   useEffect(() => {
     (async () => {
+      let loadedFromServer = false;
       try {
         const res = await fetch("/state").then((r) => r.json());
+        if (res.error) throw new Error(res.error);
         if (res.value) {
           const parsed = JSON.parse(res.value);
           setAssumptions(parsed.assumptions || {});
           setStartingBOM(parsed.startingBOM || {});
           setData(parsed.data || {});
-          setLoaded(true);
-          return;
+          loadedFromServer = true;
         }
-        if (res.error) throw new Error(res.error);
-      } catch (e) {
-        // Server storage unreachable or not configured yet - fall back to this browser's local copy.
+      } catch (e) { /* server unreachable or not configured yet - fall through to local copy below */ }
+      if (!loadedFromServer) {
+        // Nothing on the server yet (new database, or server unreachable) - load whatever this
+        // browser has locally. If the server is up, the next autosave will push this data to it.
         try {
           const raw = localStorage.getItem(STORAGE_KEY);
           if (raw) {
@@ -222,7 +224,7 @@ function OTBEngine() {
             setStartingBOM(parsed.startingBOM || {});
             setData(parsed.data || {});
           }
-        } catch (e2) { /* first run */ }
+        } catch (e2) { /* first run, nothing anywhere yet */ }
       }
       setLoaded(true);
     })();
