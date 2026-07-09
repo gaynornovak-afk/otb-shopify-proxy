@@ -300,6 +300,12 @@ function OTBEngine() {
       header: true, skipEmptyLines: true,
       complete: (res) => {
         const cols = res.meta.fields || [];
+        const isBOMFormat = cols.some((c) => c.toLowerCase().includes("shopify product type")) && cols.some((c) => c.toLowerCase().includes("beginning inv"));
+        if (isBOMFormat) {
+          setImportFormat("bom");
+          setImportPreview(res.data.slice(0, 5000));
+          return;
+        }
         const isPOFormat = cols.includes("Product Type") && cols.includes("Total Cost Ordered") && cols.includes("Total Cost Received");
         if (isPOFormat) {
           setImportFormat("po");
@@ -336,6 +342,7 @@ function OTBEngine() {
   function applyImport() {
     if (!importPreview) return;
     if (importFormat === "po") { applyPOImport(); return; }
+    if (importFormat === "bom") { applyBOMImport(); return; }
     const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
     setData((prev) => {
       const next = { ...prev };
@@ -399,6 +406,26 @@ function OTBEngine() {
       return next;
     });
     setImportSummary(`Applied ${matchedRows} line items across ${Object.keys(totals).length} product types.`);
+    setShowImport(false); setImportText(""); setImportPreview(null);
+  }
+  // Applies a "Beginning Inv $" / starting BOM template (Planning Category, Shopify Product
+  // Type, Plan Month, Beginning Inv $) as each product type's Starting Actual BOM $.
+  function applyBOMImport() {
+    const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
+    const typeCol = Object.keys(importPreview[0] || {}).find((c) => c.toLowerCase().includes("shopify product type"));
+    const invCol = Object.keys(importPreview[0] || {}).find((c) => c.toLowerCase().includes("beginning inv"));
+    let matched = 0;
+    const updates = {};
+    importPreview.forEach((r) => {
+      const typeName = (r[typeCol] || "").trim();
+      if (!typeName || !validTypes.has(typeName.toLowerCase())) return;
+      const match = TAXONOMY.find((t) => t[0].toLowerCase() === typeName.toLowerCase())[0];
+      const val = Number(String(r[invCol]).replace(/[^0-9.\-]/g, "")) || 0;
+      updates[match] = val;
+      matched++;
+    });
+    setStartingBOM((prev) => ({ ...prev, ...updates }));
+    setImportSummary(`Set starting BOM for ${matched} product types.`);
     setShowImport(false); setImportText(""); setImportPreview(null);
   }
   function handleFileUpload(e) {
@@ -689,6 +716,9 @@ function OTBEngine() {
           <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
             <b>PO/receiving export</b> (e.g. from your "PO Export" Sidekick app): Product Type, Expected Date, Received Date, Total Cost Ordered, Total Cost Received — this one auto-fills Received $ and Balance to Receive $ by month.
           </div>
+          <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
+            <b>Starting BOM template:</b> Planning Category, Shopify Product Type, Plan Month, Beginning Inv $ — sets each product type's Starting Actual BOM $.
+          </div>
           {importSummary && <div className="text-xs mb-3 p-2 rounded" style={{ background: "#EDF3EA", color: "#5B7A5B" }}>{importSummary}</div>}
           <div className="flex gap-2 mb-3">
             <button onClick={() => fileInputRef.current?.click()} className="text-xs px-3 py-1.5 rounded flex items-center gap-1" style={{ background: "#20232B", color: "#F1EEE6" }}>
@@ -700,12 +730,14 @@ function OTBEngine() {
           {importError && <div className="text-xs mt-2" style={{ color: "#B5432D" }}>{importError}</div>}
           {importPreview && (
             <div className="mt-3 text-xs max-h-40 overflow-y-auto border rounded p-2" style={{ borderColor: "#DCD5C4" }}>
-              <div className="mb-1" style={{ color: "#8C6E4A", fontWeight: 600 }}>Detected format: {importFormat === "po" ? "PO/receiving export" : "Actuals/plan"} ({importPreview.length} rows)</div>
+              <div className="mb-1" style={{ color: "#8C6E4A", fontWeight: 600 }}>Detected format: {importFormat === "po" ? "PO/receiving export" : importFormat === "bom" ? "Starting BOM template" : "Actuals/plan"} ({importPreview.length} rows)</div>
               {importPreview.slice(0, 8).map((r, i) => (
                 <div key={i} style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
                   {importFormat === "po"
                     ? `${r["Product Type"]} · ordered ${r["Total Cost Ordered"]} · received ${r["Total Cost Received"]}`
-                    : `${r["Product Type"]} · ${r["Month"]}`}
+                    : importFormat === "bom"
+                    ? `${r[Object.keys(r).find((c) => c.toLowerCase().includes("shopify product type"))]} · ${r[Object.keys(r).find((c) => c.toLowerCase().includes("beginning inv"))]}`
+                    : `${r["Product Type"]} · ${r["Month"]} · LY Sales ${r["LY Sales"] ?? "—"} · LY COGS ${r["LY COGS"] ?? "—"}`}
                 </div>
               ))}
               {importPreview.length > 8 && <div style={{ color: "#8B8F98" }}>…and {importPreview.length - 8} more rows</div>}
