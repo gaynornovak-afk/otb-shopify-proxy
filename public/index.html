@@ -241,13 +241,37 @@ function OTBEngine() {
     const gm = a.gmPct / 100;
     const wos = a.wosTarget;
     const start = num(startingBOM[type]);
+
+    // Pass 1: forecast sales/COGS per month (independent of the BOM roll-forward chain,
+    // so we can look ahead when computing a forward-looking WOS target).
+    const forecasts = months.map((mKey) => {
+      const row = getRow(type, mKey);
+      const forecastSales = num(row.lySales) * (1 + growth);
+      const forecastCOGS = forecastSales * (1 - gm);
+      return { forecastSales, forecastCOGS };
+    });
+    const WEEKS_PER_MONTH = 4.33;
+    // WOS Target EOM $ at month t = sum of forecasted COGS across the next `wos` weeks,
+    // starting at month t, prorating the final partial month. Runs out of data (and
+    // understates the target) within `wos` weeks of the end of the visible 12 months.
+    function wosTargetAt(t) {
+      let weeksLeft = wos, total = 0, idx = t;
+      while (weeksLeft > 0 && idx < forecasts.length) {
+        const take = Math.min(weeksLeft, WEEKS_PER_MONTH);
+        total += forecasts[idx].forecastCOGS * (take / WEEKS_PER_MONTH);
+        weeksLeft -= take;
+        idx++;
+      }
+      return total;
+    }
+
     let actualBOMChain = start;
     let prevTargetEOM = null;
     const out = [];
     months.forEach((mKey, t) => {
       const row = getRow(type, mKey);
-      const forecastSales = num(row.lySales) * (1 + growth);
-      const forecastCOGS = forecastSales * (1 - gm);
+      const forecastSales = forecasts[t].forecastSales;
+      const forecastCOGS = forecasts[t].forecastCOGS;
       const expected = num(row.received) + num(row.balanceToReceive);
       const hasActualsThisMonth = row.actualSales !== "" && row.actualSales !== undefined;
       const actualBOMForThisMonth = t === 0 ? start : actualBOMChain;
@@ -260,7 +284,7 @@ function OTBEngine() {
       else { basis = prevTargetEOM; basisSource = "target (rolled)"; }
 
       const targetEOM = basis + expected - forecastCOGS;
-      const wosTargetEOM = forecastCOGS > 0 ? (forecastCOGS / 4.33) * wos : 0;
+      const wosTargetEOM = wosTargetAt(t);
       const overUnder = wosTargetEOM - targetEOM;
       const buyAction = overUnder > 0 ? "Buy" : overUnder < 0 ? "Don't Buy" : "On Target";
 
@@ -654,7 +678,7 @@ function OTBEngine() {
         <div className="mt-4 flex items-start gap-2 text-xs" style={{ color: "#8B8F98" }}>
           <Icon.info />
           <span>
-            Target EOM $ = BOM $ + Expected receipts − Forecast COGS. BOM $ auto-rolls from actual COGS/receipts while actual sales are entered; once a month has no actual sales yet, it automatically switches to rolling forward from the prior month's Target EOM. WOS Target EOM $ = Forecast COGS ÷ 4.33 × WOS target. Over/Under $ = WOS Target EOM − Target EOM. Positive = Buy. Click any row to open its full monthly ledger and edit inputs.
+            Target EOM $ = BOM $ + Expected receipts − Forecast COGS. BOM $ auto-rolls from actual COGS/receipts while actual sales are entered; once a month has no actual sales yet, it automatically switches to rolling forward from the prior month's Target EOM. WOS Target EOM $ = sum of forecasted COGS across the next N weeks (your WOS target) starting that month, prorated for partial months — a forward-looking target, not a single-month rate extrapolation, so it responds to seasonality. It understates near the end of the visible 12 months since there's no forecast data beyond that window to sum. Over/Under $ = WOS Target EOM − Target EOM. Positive = Buy. Click any row to open its full monthly ledger and edit inputs.
           </span>
         </div>
       </div>
