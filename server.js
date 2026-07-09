@@ -35,6 +35,7 @@ if (!STORE || !TOKEN) {
 
 const app = express();
 app.use(cors({ origin: ALLOWED_ORIGIN }));
+app.use(express.static(require("path").join(__dirname, "public")));
 
 async function shopifyGraphQL(query, variables) {
   const res = await fetch(`https://${STORE}/admin/api/${API_VERSION}/graphql.json`, {

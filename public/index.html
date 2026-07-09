@@ -1,0 +1,730 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>OTB Engine</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Roboto+Slab:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  body { margin: 0; font-family: 'Inter', sans-serif; }
+  ::-webkit-scrollbar { height: 10px; width: 10px; }
+  ::-webkit-scrollbar-thumb { background: #C4B9A0; border-radius: 5px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef, Fragment } = React;
+const Papa = window.Papa;
+
+const SWATCHES = ["#C99A3C", "#B5432D", "#5B7A5B", "#4A6280", "#7A5580", "#8C6E4A", "#5C8A8A", "#9C5B7A", "#6B7A3A", "#3A6B7A", "#8A6B3A", "#7A3A5B", "#4A5B7A"];
+const CATW = 128, TYPEW = 220;
+const STORAGE_KEY = "otb-engine-v4";
+
+const TAXONOMY = [
+  ["1100 Fashion Tops", "1100 Fashion Tops"],
+  ["1101 Tees/Tunics Solid", "1110 Tee/Tunic"],
+  ["1102 Tees/Tunics Printed", "1110 Tee/Tunic"],
+  ["1103 Tanks Solid", "1130 Tanks"],
+  ["1104 Tanks Printed", "1130 Tanks"],
+  ["1105 Blouses/Shirts Solid", "1150 Blouses/Shirts"],
+  ["1106 Blouses/Shirts Printed", "1150 Blouses/Shirts"],
+  ["1202 Vest", "1200 Sweaters"],
+  ["1203 Cardigan", "1200 Sweaters"],
+  ["1204 Crewneck", "1200 Sweaters"],
+  ["1205 V-Neck", "1200 Sweaters"],
+  ["1206 Turtleneck", "1200 Sweaters"],
+  ["1207 Cowl Neck", "1200 Sweaters"],
+  ["2101 Blazer", "2100 Jackets"],
+  ["2102 Casual", "2100 Jackets"],
+  ["2103 Denim", "2100 Jackets"],
+  ["2104 Quilted/Puffers", "2100 Jackets"],
+  ["2105 Duster", "2100 Jackets"],
+  ["2106 Coverup", "2100 Jackets"],
+  ["2107 Vest", "2100 Jackets"],
+  ["2108 Cardigan", "2100 Jackets"],
+  ["3101 Bootcut Pants", "3100 Bottoms"],
+  ["3102 Flare Pants", "3100 Bottoms"],
+  ["3103 Wide Leg Pants", "3100 Bottoms"],
+  ["3104 Jogger Pants", "3100 Bottoms"],
+  ["3105 Slim Leg Pants", "3100 Bottoms"],
+  ["3106 Straight Pants", "3100 Bottoms"],
+  ["3107 Tights/Leggings", "3100 Bottoms"],
+  ["3108 Skirts", "3100 Bottoms"],
+  ["3109 Shorts", "3100 Bottoms"],
+  ["3110 Fashion Pant", "3100 Bottoms"],
+  ["3201 Always In Stock", "3200 Denim"],
+  ["3202 Fashion Denim", "3200 Denim"],
+  ["4101 Solid Dresses", "4100 Dresses/Jumpsuits"],
+  ["4102 Printed Dresses", "4100 Dresses/Jumpsuits"],
+  ["4103 Solid Jumpsuits", "4100 Dresses/Jumpsuits"],
+  ["4104 Printed Jumpsuits", "4100 Dresses/Jumpsuits"],
+  ["5101 Misc Acc", "5100 Accessories"],
+  ["5102 Handbags", "5100 Accessories"],
+  ["5103 Bath/Beauty/Gifts", "5100 Accessories"],
+  ["5104 Scarves", "5100 Accessories"],
+  ["5105 Hats", "5100 Accessories"],
+  ["5106 Gloves", "5100 Accessories"],
+  ["5107 Belts", "5100 Accessories"],
+  ["5108 Eyeglasses", "5100 Accessories"],
+  ["5109 Socks", "5100 Accessories"],
+  ["5110 Wallets", "5100 Accessories"],
+  ["5111 Basics", "5100 Accessories"],
+  ["5201 Earrings", "5200 Jewelry"],
+  ["5202 Necklaces", "5200 Jewelry"],
+  ["5203 Bracelets", "5200 Jewelry"],
+  ["5204 Rings", "5200 Jewelry"],
+  ["5205 Misc Jewelry", "5200 Jewelry"],
+  ["6101 Sneakers", "6100 Footwear"],
+  ["6102 Loafers", "6100 Footwear"],
+  ["6103 Pumps", "6100 Footwear"],
+  ["6104 Flats", "6100 Footwear"],
+  ["6105 Sandals", "6100 Footwear"],
+  ["6106 Boots", "6100 Footwear"],
+  ["6107 Slippers", "6100 Footwear"],
+  ["9999 Unclassified", "9999 Unclassified"],
+];
+const CATEGORIES = [...new Set(TAXONOMY.map((t) => t[1]))];
+const CATEGORY_COLOR = Object.fromEntries(CATEGORIES.map((c, i) => [c, SWATCHES[i % SWATCHES.length]]));
+const TYPES_BY_CATEGORY = Object.fromEntries(CATEGORIES.map((c) => [c, TAXONOMY.filter((t) => t[1] === c).map((t) => t[0])]));
+
+const METRICS = [
+  { key: "overUnder", label: "Over/Under $" },
+  { key: "targetEOM", label: "Target EOM $" },
+  { key: "wosTargetEOM", label: "WOS Target EOM $" },
+  { key: "forecastSales", label: "Forecast Sales $" },
+  { key: "forecastCOGS", label: "Forecast COGS $" },
+  { key: "actualSales", label: "Actual Sales $" },
+  { key: "buyAction", label: "Buy Action" },
+];
+function metricValue(s, key) {
+  if (key === "actualSales") return s.row.actualSales === "" || s.row.actualSales === undefined ? null : Number(s.row.actualSales);
+  if (key === "buyAction") return s.buyAction;
+  return s[key];
+}
+
+function monthKey(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; }
+function monthLabel(key) { const [y, m] = key.split("-").map(Number); return new Date(y, m - 1, 1).toLocaleDateString("en-US", { month: "short", year: "2-digit" }); }
+function next12Months() { const out = []; const now = new Date(); now.setDate(1); for (let i = 0; i < 12; i++) { const d = new Date(now.getFullYear(), now.getMonth() + i, 1); out.push(monthKey(d)); } return out; }
+function money(n) { if (n === null || n === undefined) return "—"; const v = Number(n) || 0; return v.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }); }
+function num(v) { return v === "" || v === undefined || v === null ? 0 : Number(v); }
+function emptyRow() {
+  return { lySales: 0, lyCogs: 0, actualSales: "", actualCogs: "", received: 0, balanceToReceive: 0, targetBOMOverride: "", actualBOMOverride: "" };
+}
+function defaultAssumptions() { return { growthPct: 3, wosTarget: 12, gmPct: 55 }; }
+
+const INPUT_FIELDS = [
+  { key: "lySales", label: "LY Net Sales Retail $" },
+  { key: "lyCogs", label: "LY COGS $" },
+  { key: "actualSales", label: "Actual Net Sales Retail $", muted: true },
+  { key: "actualCogs", label: "Actual COGS $", muted: true },
+  { key: "received", label: "Received $" },
+  { key: "balanceToReceive", label: "Balance to Receive $" },
+  { key: "targetBOMOverride", label: "Target BOM $ (override)", muted: true },
+  { key: "actualBOMOverride", label: "Actual BOM $ (override)", muted: true },
+];
+
+// ---- tiny inline icon set (no icon library needed) ----
+const Icon = {
+  chevronLeft: (p) => <svg width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M15 18l-6-6 6-6"/></svg>,
+  chevronRight: (p) => <svg width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M9 18l6-6-6-6"/></svg>,
+  chevronUp: (p) => <svg width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M18 15l-6-6-6 6"/></svg>,
+  chevronDown: (p) => <svg width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M6 9l6 6 6-6"/></svg>,
+  upload: (p) => <svg width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 19V5M5 12l7-7 7 7"/></svg>,
+  download: (p) => <svg width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12l7 7 7-7"/></svg>,
+  info: (p) => <svg width={p.size||13} height={p.size||13} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>,
+  x: (p) => <svg width={p.size||18} height={p.size||18} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6L6 18M6 6l12 12"/></svg>,
+  check: (p) => <svg width={p.size||13} height={p.size||13} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M20 6L9 17l-5-5"/></svg>,
+  search: (p) => <svg width={p.size||13} height={p.size||13} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.3-4.3"/></svg>,
+  sliders: (p) => <svg width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>,
+  refresh: (p) => <svg width={p.size||13} height={p.size||13} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>,
+  wifi: (p) => <svg width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 12.55a11 11 0 0114.08 0M1.42 9a16 16 0 0121.16 0M8.53 16.11a6 6 0 016.95 0M12 20h.01"/></svg>,
+};
+
+// ---- tiny inline bar chart (no chart library needed) ----
+function MiniBarChart({ data }) {
+  const w = 600, h = 130, padL = 44, padB = 18, padT = 8;
+  const vals = data.map((d) => d.value);
+  const maxAbs = Math.max(1, ...vals.map((v) => Math.abs(v)));
+  const zeroY = padT + (h - padT - padB) * 0.5;
+  const scale = (h - padT - padB) / 2 / maxAbs;
+  const barW = (w - padL - 10) / data.length - 6;
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="w-full" style={{ height: 130 }}>
+      <line x1={padL} y1={zeroY} x2={w - 5} y2={zeroY} stroke="#C4B9A0" strokeWidth="1" />
+      {data.map((d, i) => {
+        const x = padL + i * ((w - padL - 10) / data.length) + 3;
+        const barH = Math.abs(d.value) * scale;
+        const y = d.value >= 0 ? zeroY - barH : zeroY;
+        return (
+          <g key={i}>
+            <rect x={x} y={y} width={Math.max(barW, 2)} height={Math.max(barH, 1)} fill="#C99A3C" rx="2" />
+            <text x={x + barW / 2} y={h - 4} fontSize="9" fill="#8B8F98" textAnchor="middle" fontFamily="IBM Plex Mono, monospace">{d.month}</text>
+          </g>
+        );
+      })}
+      <text x={2} y={zeroY + 3} fontSize="9" fill="#8B8F98" fontFamily="IBM Plex Mono, monospace">$0</text>
+    </svg>
+  );
+}
+
+function OTBEngine() {
+  const months = useMemo(() => next12Months(), []);
+  const [assumptions, setAssumptions] = useState({});
+  const [startingBOM, setStartingBOM] = useState({});
+  const [data, setData] = useState({});
+  const [expandedType, setExpandedType] = useState(null);
+  const [monthCursor, setMonthCursor] = useState(0);
+  const [scrollStart, setScrollStart] = useState(0);
+  const [loaded, setLoaded] = useState(false);
+  const [saveState, setSaveState] = useState("idle");
+  const [filterText, setFilterText] = useState("");
+  const [metric, setMetric] = useState("overUnder");
+  const [showImport, setShowImport] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showSync, setShowSync] = useState(false);
+  const [syncStatus, setSyncStatus] = useState("");
+  const [syncing, setSyncing] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [importPreview, setImportPreview] = useState(null);
+  const [importError, setImportError] = useState("");
+  const fileInputRef = useRef(null);
+  const visibleMonths = 6;
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        setAssumptions(parsed.assumptions || {});
+        setStartingBOM(parsed.startingBOM || {});
+        setData(parsed.data || {});
+      }
+    } catch (e) { /* first run */ }
+    setLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    setSaveState("saving");
+    const t = setTimeout(() => {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({ assumptions, startingBOM, data }));
+        setSaveState("saved");
+      } catch (e) { setSaveState("error"); }
+    }, 400);
+    return () => clearTimeout(t);
+  }, [assumptions, startingBOM, data, loaded]);
+
+  function getAssumptions(cat) { return assumptions[cat] || defaultAssumptions(); }
+  function setAssumption(cat, patch) { setAssumptions((prev) => ({ ...prev, [cat]: { ...getAssumptions(cat), ...patch } })); }
+  function getRow(type, mKey) { return (data[type] && data[type][mKey]) || emptyRow(); }
+  function setRow(type, mKey, patch) {
+    setData((prev) => {
+      const typeData = { ...(prev[type] || {}) };
+      typeData[mKey] = { ...(typeData[mKey] || emptyRow()), ...patch };
+      return { ...prev, [type]: typeData };
+    });
+  }
+
+  function computeSeries(type, cat) {
+    const a = getAssumptions(cat);
+    const growth = a.growthPct / 100;
+    const gm = a.gmPct / 100;
+    const wos = a.wosTarget;
+    const start = num(startingBOM[type]);
+    let actualBOMChain = start;
+    let prevTargetEOM = null;
+    const out = [];
+    months.forEach((mKey, t) => {
+      const row = getRow(type, mKey);
+      const forecastSales = num(row.lySales) * (1 + growth);
+      const forecastCOGS = forecastSales * (1 - gm);
+      const expected = num(row.received) + num(row.balanceToReceive);
+      const hasActualsThisMonth = row.actualSales !== "" && row.actualSales !== undefined;
+      const actualBOMForThisMonth = t === 0 ? start : actualBOMChain;
+
+      let basis, basisSource;
+      if (row.targetBOMOverride !== "" && row.targetBOMOverride !== undefined) { basis = num(row.targetBOMOverride); basisSource = "target override"; }
+      else if (row.actualBOMOverride !== "" && row.actualBOMOverride !== undefined) { basis = num(row.actualBOMOverride); basisSource = "actual override"; }
+      else if (t === 0) { basis = start; basisSource = "starting BOM"; }
+      else if (hasActualsThisMonth) { basis = actualBOMForThisMonth; basisSource = "actual (rolled)"; }
+      else { basis = prevTargetEOM; basisSource = "target (rolled)"; }
+
+      const targetEOM = basis + expected - forecastCOGS;
+      const wosTargetEOM = forecastCOGS > 0 ? (forecastCOGS / 4.33) * wos : 0;
+      const overUnder = wosTargetEOM - targetEOM;
+      const buyAction = overUnder > 0 ? "Buy" : overUnder < 0 ? "Don't Buy" : "On Target";
+
+      out.push({ mKey, row, forecastSales, forecastCOGS, expected, basis, basisSource, targetEOM, wosTargetEOM, overUnder, buyAction });
+      actualBOMChain = actualBOMForThisMonth - num(row.actualCogs) + num(row.received);
+      prevTargetEOM = targetEOM;
+    });
+    return out;
+  }
+
+  const seriesByType = useMemo(() => {
+    const m = {};
+    TAXONOMY.forEach(([type, cat]) => { m[type] = computeSeries(type, cat); });
+    return m;
+  }, [data, assumptions, startingBOM, months]);
+
+  const filteredTaxonomy = TAXONOMY.filter(([type, cat]) => (cat + " " + type).toLowerCase().includes(filterText.toLowerCase()));
+
+  function categoryBuyTotal(cat, monthIdx) {
+    return TYPES_BY_CATEGORY[cat].reduce((sum, t) => sum + Math.max(seriesByType[t][monthIdx].overUnder, 0), 0);
+  }
+  const categoryTotalsThisMonth = useMemo(() => {
+    const o = {};
+    CATEGORIES.forEach((c) => { o[c] = categoryBuyTotal(c, monthCursor); });
+    return o;
+  }, [seriesByType, monthCursor]);
+
+  const grandTotalBuy = Object.values(categoryTotalsThisMonth).reduce((a, b) => a + b, 0);
+  const grandTotalOverstock = CATEGORIES.reduce((sum, cat) => sum + TYPES_BY_CATEGORY[cat].reduce((s2, t) => s2 + Math.min(seriesByType[t][monthCursor].overUnder, 0), 0), 0);
+
+  const expandedSeries = expandedType ? seriesByType[expandedType] : null;
+  const chartData = expandedSeries ? expandedSeries.map((s) => ({ month: monthLabel(s.mKey), value: Math.round(s.overUnder) })) : [];
+
+  function parseAndPreview(text) {
+    setImportError("");
+    Papa.parse(text.trim(), {
+      header: true, skipEmptyLines: true,
+      complete: (res) => {
+        const cols = res.meta.fields || [];
+        const required = ["Product Type", "Month"];
+        const missing = required.filter((r) => !cols.includes(r));
+        if (missing.length) { setImportError(`Missing required column(s): ${missing.join(", ")}.`); setImportPreview(null); return; }
+        setImportPreview(res.data.slice(0, 2000));
+      },
+      error: (err) => { setImportError("Could not parse that CSV: " + err.message); setImportPreview(null); },
+    });
+  }
+  function applyImport() {
+    if (!importPreview) return;
+    const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
+    setData((prev) => {
+      const next = { ...prev };
+      importPreview.forEach((r) => {
+        const typeName = (r["Product Type"] || "").trim();
+        const mRaw = (r["Month"] || "").trim();
+        if (!typeName || !mRaw || !validTypes.has(typeName.toLowerCase())) return;
+        const match = TAXONOMY.find((t) => t[0].toLowerCase() === typeName.toLowerCase())[0];
+        let mKey = mRaw;
+        if (/^\d{4}-\d{1,2}$/.test(mRaw)) { const [y, m] = mRaw.split("-"); mKey = `${y}-${m.padStart(2, "0")}`; }
+        const typeData = { ...(next[match] || {}) };
+        const existing = typeData[mKey] || emptyRow();
+        const patch = {};
+        const map = { "LY Sales": "lySales", "LY COGS": "lyCogs", "Actual Sales": "actualSales", "Actual COGS": "actualCogs", "Received": "received", "Balance to Receive": "balanceToReceive", "Target BOM Override": "targetBOMOverride", "Actual BOM Override": "actualBOMOverride" };
+        Object.entries(map).forEach(([col, key]) => { if (r[col] !== undefined && r[col] !== "") patch[key] = Number(r[col]); });
+        typeData[mKey] = { ...existing, ...patch };
+        next[match] = typeData;
+      });
+      return next;
+    });
+    setShowImport(false); setImportText(""); setImportPreview(null);
+  }
+  function handleFileUpload(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => { const text = ev.target.result; setImportText(text); parseAndPreview(text); };
+    reader.readAsText(file);
+  }
+  function exportCSV() {
+    const rows = [];
+    TAXONOMY.forEach(([type, cat]) => {
+      seriesByType[type].forEach((s) => {
+        rows.push({
+          "Planning Category": cat, "Product Type": type, "Month": s.mKey,
+          "LY Sales": s.row.lySales, "LY COGS": s.row.lyCogs,
+          "Actual Sales": s.row.actualSales, "Actual COGS": s.row.actualCogs,
+          "Received": s.row.received, "Balance to Receive": s.row.balanceToReceive,
+          "Forecast Sales $": Math.round(s.forecastSales), "Forecast COGS $": Math.round(s.forecastCOGS),
+          "BOM $": Math.round(s.basis), "BOM Source": s.basisSource,
+          "Target EOM $": Math.round(s.targetEOM), "WOS Target EOM $": Math.round(s.wosTargetEOM),
+          "Over/Under $": Math.round(s.overUnder), "Buy Action": s.buyAction,
+        });
+      });
+    });
+    const csv = Papa.unparse(rows);
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "otb-engine-export.csv"; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // ---------- Live Shopify sync (same-origin - this page IS the backend) ----------
+  async function testConnection() {
+    setSyncStatus("Testing connection…");
+    try {
+      const res = await fetch(`/health`).then((r) => r.json());
+      setSyncStatus(res.ok ? `Connected to ${res.store}` : "Reached the server but got an unexpected response.");
+    } catch (e) { setSyncStatus("Could not reach the backend: " + e.message); }
+  }
+  async function syncSales() {
+    setSyncing(true);
+    setSyncStatus(`Syncing sales & COGS for ${monthLabel(months[monthCursor])}…`);
+    try {
+      const mStr = months[monthCursor];
+      const [y, m] = mStr.split("-").map(Number);
+      const lastDay = new Date(y, m, 0).getDate();
+      const start = `${mStr}-01`;
+      const end = `${mStr}-${String(lastDay).padStart(2, "0")}`;
+      const lyStart = `${y - 1}-${String(m).padStart(2, "0")}-01`;
+      const lyEnd = `${y - 1}-${String(m).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+      const [cur, ly] = await Promise.all([
+        fetch(`/sales-by-type?start=${start}&end=${end}`).then((r) => r.json()),
+        fetch(`/sales-by-type?start=${lyStart}&end=${lyEnd}`).then((r) => r.json()),
+      ]);
+      if (cur.error) throw new Error(cur.error);
+      if (ly.error) throw new Error(ly.error);
+      let matched = 0;
+      TAXONOMY.forEach(([type]) => {
+        const c = cur.totals?.[type];
+        const l = ly.totals?.[type];
+        if (!c && !l) return;
+        matched++;
+        const patch = {};
+        if (c) { patch.actualSales = Number(c.sales.toFixed(2)); patch.actualCogs = Number(c.cogs.toFixed(2)); }
+        if (l) { patch.lySales = Number(l.sales.toFixed(2)); patch.lyCogs = Number(l.cogs.toFixed(2)); }
+        setRow(type, mStr, patch);
+      });
+      setSyncStatus(`Synced ${matched} of ${TAXONOMY.length} product types for ${monthLabel(mStr)}.`);
+    } catch (e) { setSyncStatus("Sync failed: " + e.message); }
+    setSyncing(false);
+  }
+  async function syncInventory() {
+    setSyncing(true);
+    setSyncStatus("Syncing current inventory…");
+    try {
+      const res = await fetch(`/inventory-by-type`).then((r) => r.json());
+      if (res.error) throw new Error(res.error);
+      let matched = 0;
+      const mStr = months[monthCursor];
+      TAXONOMY.forEach(([type]) => {
+        const t = res.totals?.[type];
+        if (!t) return;
+        matched++;
+        if (monthCursor === 0) setStartingBOM((prev) => ({ ...prev, [type]: Number(t.value.toFixed(2)) }));
+        else setRow(type, mStr, { actualBOMOverride: Number(t.value.toFixed(2)) });
+      });
+      setSyncStatus(`Synced current inventory value for ${matched} of ${TAXONOMY.length} product types.`);
+    } catch (e) { setSyncStatus("Sync failed: " + e.message); }
+    setSyncing(false);
+  }
+
+  if (!loaded) {
+    return <div style={{ background: "#1B2027", minHeight: "100vh" }} className="flex items-center justify-center"><div style={{ color: "#EDE7DA", fontFamily: "'IBM Plex Mono', monospace" }}>Loading engine…</div></div>;
+  }
+
+  const visibleMonthKeys = months.slice(scrollStart, scrollStart + visibleMonths);
+
+  return (
+    <div style={{ background: "#F1EEE6", minHeight: "100vh", fontFamily: "'Inter', sans-serif", color: "#20232B" }}>
+      <div style={{ background: "#1B2027", borderBottom: "3px solid #C99A3C" }} className="px-4 sm:px-8 py-5">
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <div style={{ fontFamily: "'Roboto Slab', serif", color: "#F1EEE6" }} className="text-xl sm:text-2xl font-bold">OTB ENGINE</div>
+            <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-xs mt-1">
+              category · product type · 12 months · {saveState === "saving" ? "saving…" : saveState === "saved" ? "saved" : ""}
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={() => setShowSync(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
+              <Icon.wifi /> Sync
+            </button>
+            <button onClick={() => setShowSettings(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
+              <Icon.sliders /> Assumptions
+            </button>
+            <button onClick={() => setShowImport(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
+              <Icon.upload /> Import
+            </button>
+            <button onClick={exportCSV} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
+              <Icon.download /> Export
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="px-4 sm:px-8 py-4" style={{ background: "#20232B" }}>
+        <div className="flex flex-wrap items-center gap-8">
+          <div className="flex items-center gap-2">
+            <button onClick={() => setMonthCursor((c) => Math.max(0, c - 1))} disabled={monthCursor === 0} className="p-1 rounded disabled:opacity-30" style={{ background: "#2A303B", color: "#EDE7DA" }}><Icon.chevronLeft /></button>
+            <span style={{ color: "#EDE7DA", fontFamily: "'IBM Plex Mono', monospace" }} className="text-sm w-16 text-center">{monthLabel(months[monthCursor])}</span>
+            <button onClick={() => setMonthCursor((c) => Math.min(11, c + 1))} disabled={monthCursor === 11} className="p-1 rounded disabled:opacity-30" style={{ background: "#2A303B", color: "#EDE7DA" }}><Icon.chevronRight /></button>
+          </div>
+          <div>
+            <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">Total to buy</div>
+            <div style={{ fontFamily: "'Roboto Slab', serif", color: "#D9B15C" }} className="text-2xl font-bold">{money(grandTotalBuy)}</div>
+          </div>
+          <div>
+            <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">Overstock</div>
+            <div style={{ fontFamily: "'Roboto Slab', serif", color: "#D97A6A" }} className="text-2xl font-bold">{money(grandTotalOverstock)}</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="px-4 sm:px-8 py-4">
+        <div className="flex flex-wrap items-center gap-3 mb-3">
+          <div className="flex items-center gap-2 px-2 py-1.5 rounded border flex-1 min-w-[200px]" style={{ borderColor: "#DCD5C4", background: "#FFFFFF" }}>
+            <Icon.search />
+            <input value={filterText} onChange={(e) => setFilterText(e.target.value)} placeholder="Filter by category or product type…" className="text-xs flex-1 outline-none" style={{ background: "transparent" }} />
+          </div>
+          <label className="text-xs flex items-center gap-1.5" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
+            Show
+            <select value={metric} onChange={(e) => setMetric(e.target.value)} className="border rounded px-2 py-1.5 text-xs" style={{ borderColor: "#DCD5C4", background: "#FFFFFF" }}>
+              {METRICS.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}
+            </select>
+          </label>
+          <div className="flex items-center gap-1">
+            <button onClick={() => setScrollStart((s) => Math.max(0, s - 1))} disabled={scrollStart === 0} className="p-1.5 rounded disabled:opacity-30" style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }}><Icon.chevronLeft /></button>
+            <span style={{ fontFamily: "'IBM Plex Mono', monospace" }} className="text-xs text-[#5C6270] w-28 text-center">{monthLabel(months[scrollStart])} – {monthLabel(months[Math.min(scrollStart + visibleMonths - 1, 11)])}</span>
+            <button onClick={() => setScrollStart((s) => Math.min(months.length - visibleMonths, s + 1))} disabled={scrollStart >= months.length - visibleMonths} className="p-1.5 rounded disabled:opacity-30" style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }}><Icon.chevronRight /></button>
+          </div>
+        </div>
+
+        <div style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }} className="rounded-md overflow-hidden">
+          <div style={{ maxHeight: "70vh", overflow: "auto", position: "relative" }}>
+            <table style={{ borderCollapse: "collapse", fontFamily: "'IBM Plex Mono', monospace", width: "max-content", minWidth: "100%" }} className="text-xs sm:text-sm">
+              <thead>
+                <tr>
+                  <th style={{ position: "sticky", top: 0, left: 0, zIndex: 4, background: "#20232B", color: "#EDE7DA", minWidth: CATW, width: CATW }} className="text-left py-2 px-3">Category</th>
+                  <th style={{ position: "sticky", top: 0, left: CATW, zIndex: 4, background: "#20232B", color: "#EDE7DA", minWidth: TYPEW, width: TYPEW }} className="text-left py-2 px-3">Product Type</th>
+                  {visibleMonthKeys.map((m) => (
+                    <th key={m} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA", minWidth: 105 }} className="text-right py-2 px-3">{monthLabel(m)}</th>
+                  ))}
+                  <th style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", minWidth: 32 }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredTaxonomy.map(([type, cat]) => {
+                  const series = seriesByType[type];
+                  const isOpen = expandedType === type;
+                  const rowBg = isOpen ? "#FAF8F3" : "#FFFFFF";
+                  return (
+                    <Fragment key={type}>
+                      <tr className="cursor-pointer" onClick={() => setExpandedType(isOpen ? null : type)} style={{ borderTop: "1px solid #EDE9DE" }}>
+                        <td style={{ position: "sticky", left: 0, zIndex: 2, background: rowBg }} className="py-2 px-3">
+                          <span className="flex items-center gap-1.5">
+                            <span style={{ width: 8, height: 8, borderRadius: 2, background: CATEGORY_COLOR[cat], flexShrink: 0 }} />
+                            <span style={{ fontSize: 11, color: "#5C6270" }}>{cat}</span>
+                          </span>
+                        </td>
+                        <td style={{ position: "sticky", left: CATW, zIndex: 2, background: rowBg, color: "#20232B", fontWeight: 500 }} className="py-2 px-3">{type}</td>
+                        {series.slice(scrollStart, scrollStart + visibleMonths).map((s, i) => {
+                          const v = metricValue(s, metric);
+                          if (metric === "buyAction") {
+                            const actionColor = v === "Buy" ? "#8C6E4A" : v === "Don't Buy" ? "#B5432D" : "#5B7A5B";
+                            return <td key={i} className="text-right py-2 px-3"><span className="px-2 py-0.5 rounded-full text-[10px]" style={{ background: `${actionColor}22`, color: actionColor, fontWeight: 700 }}>{v}</span></td>;
+                          }
+                          return <td key={i} className="text-right py-2 px-3" style={{ color: v < 0 ? "#B5432D" : "#20232B" }}>{money(v)}</td>;
+                        })}
+                        <td className="text-center py-2">{isOpen ? <Icon.chevronUp /> : <Icon.chevronDown />}</td>
+                      </tr>
+                      {isOpen && (
+                        <tr>
+                          <td colSpan={visibleMonths + 3} style={{ background: "#FAF8F3", position: "sticky", left: 0 }} className="p-3">
+                            <div style={{ width: "min(90vw, 900px)" }}>
+                              <TypeDetail
+                                type={type} months={months} series={series}
+                                scrollStart={scrollStart} setScrollStart={setScrollStart} visibleMonths={visibleMonths}
+                                getRow={getRow} setRow={setRow}
+                                startingBOM={startingBOM[type]}
+                                setStartingBOM={(v) => setStartingBOM((prev) => ({ ...prev, [type]: v }))}
+                                chartData={chartData}
+                              />
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="mt-4 flex items-start gap-2 text-xs" style={{ color: "#8B8F98" }}>
+          <Icon.info />
+          <span>
+            Target EOM $ = BOM $ + Expected receipts − Forecast COGS. BOM $ auto-rolls from actual COGS/receipts while actual sales are entered; once a month has no actual sales yet, it automatically switches to rolling forward from the prior month's Target EOM. WOS Target EOM $ = Forecast COGS ÷ 4.33 × WOS target. Over/Under $ = WOS Target EOM − Target EOM. Positive = Buy. Click any row to open its full monthly ledger and edit inputs.
+          </span>
+        </div>
+      </div>
+
+      {showSync && (
+        <Modal onClose={() => setShowSync(false)} title="Live sync from Shopify">
+          <p className="text-sm mb-3" style={{ color: "#5C6270" }}>
+            This page is served directly by your Shopify proxy, so sync talks to it automatically - no URL to paste. Pulls Actual Sales, Actual COGS, LY Sales/COGS, and current inventory value. Received $ and Balance to Receive $ still need to be entered by hand.
+          </p>
+          <div className="flex gap-2 mb-3">
+            <button onClick={testConnection} className="text-xs px-3 py-1.5 rounded" style={{ background: "#E6E1D6" }}>Test connection</button>
+          </div>
+          <div className="p-3 rounded mb-3" style={{ background: "#F1EEE6" }}>
+            <div className="text-xs mb-2" style={{ color: "#5C6270" }}>Syncing into: <b>{monthLabel(months[monthCursor])}</b> (change the month with the dashboard arrows before syncing)</div>
+            <div className="flex gap-2 flex-wrap">
+              <button onClick={syncSales} disabled={syncing} className="text-xs px-3 py-2 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
+                <Icon.refresh /> Sync Sales & COGS
+              </button>
+              <button onClick={syncInventory} disabled={syncing} className="text-xs px-3 py-2 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
+                <Icon.refresh /> Sync Inventory
+              </button>
+            </div>
+          </div>
+          {syncStatus && <div className="text-xs" style={{ color: syncStatus.startsWith("Sync failed") || syncStatus.startsWith("Could not") ? "#B5432D" : "#5B7A5B" }}>{syncStatus}</div>}
+          <div className="flex justify-end mt-4">
+            <button onClick={() => setShowSync(false)} className="text-xs px-3 py-2 rounded" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 600 }}>Done</button>
+          </div>
+        </Modal>
+      )}
+
+      {showSettings && (
+        <Modal onClose={() => setShowSettings(false)} title="Category assumptions">
+          <div className="space-y-2 max-h-96 overflow-y-auto">
+            {CATEGORIES.map((c) => {
+              const a = getAssumptions(c);
+              return (
+                <div key={c} className="flex items-center gap-2 p-2 rounded border text-xs flex-wrap" style={{ borderColor: "#DCD5C4" }}>
+                  <span style={{ width: 9, height: 9, borderRadius: 2, background: CATEGORY_COLOR[c], flexShrink: 0 }} />
+                  <span className="flex-1 min-w-[140px]" style={{ fontWeight: 500 }}>{c}</span>
+                  <label className="flex items-center gap-1">Growth % <input type="number" value={a.growthPct} onChange={(e) => setAssumption(c, { growthPct: Number(e.target.value) })} className="w-14 border rounded px-1 py-1" style={{ borderColor: "#DCD5C4" }} /></label>
+                  <label className="flex items-center gap-1">WOS <input type="number" value={a.wosTarget} onChange={(e) => setAssumption(c, { wosTarget: Number(e.target.value) })} className="w-14 border rounded px-1 py-1" style={{ borderColor: "#DCD5C4" }} /></label>
+                  <label className="flex items-center gap-1">GM % <input type="number" value={a.gmPct} onChange={(e) => setAssumption(c, { gmPct: Number(e.target.value) })} className="w-14 border rounded px-1 py-1" style={{ borderColor: "#DCD5C4" }} /></label>
+                </div>
+              );
+            })}
+          </div>
+          <div className="flex justify-end mt-4">
+            <button onClick={() => setShowSettings(false)} className="text-xs px-3 py-2 rounded" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 600 }}>Done</button>
+          </div>
+        </Modal>
+      )}
+
+      {showImport && (
+        <Modal onClose={() => { setShowImport(false); setImportPreview(null); setImportError(""); }} title="Import actuals from CSV">
+          <p className="text-sm mb-3" style={{ color: "#5C6270" }}>Expected columns (Product Type must exactly match your Shopify Type field):</p>
+          <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
+            Product Type, Month, LY Sales, LY COGS, Actual Sales, Actual COGS, Received, Balance to Receive, Target BOM Override, Actual BOM Override
+          </div>
+          <div className="flex gap-2 mb-3">
+            <button onClick={() => fileInputRef.current?.click()} className="text-xs px-3 py-1.5 rounded flex items-center gap-1" style={{ background: "#20232B", color: "#F1EEE6" }}>
+              <Icon.upload /> Upload CSV file
+            </button>
+            <input ref={fileInputRef} type="file" accept=".csv" className="hidden" onChange={handleFileUpload} />
+          </div>
+          <textarea value={importText} onChange={(e) => { setImportText(e.target.value); parseAndPreview(e.target.value); }} placeholder="Product Type,Month,LY Sales,LY COGS,Actual Sales,Actual COGS,Received,Balance to Receive" className="w-full h-28 text-xs p-2 rounded border font-mono" style={{ borderColor: "#DCD5C4" }} />
+          {importError && <div className="text-xs mt-2" style={{ color: "#B5432D" }}>{importError}</div>}
+          {importPreview && (
+            <div className="mt-3 text-xs max-h-40 overflow-y-auto border rounded p-2" style={{ borderColor: "#DCD5C4" }}>
+              {importPreview.slice(0, 8).map((r, i) => (<div key={i} style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{r["Product Type"]} · {r["Month"]}</div>))}
+              {importPreview.length > 8 && <div style={{ color: "#8B8F98" }}>…and {importPreview.length - 8} more rows</div>}
+            </div>
+          )}
+          <div className="flex justify-end gap-2 mt-4">
+            <button onClick={() => setShowImport(false)} className="text-xs px-3 py-2 rounded" style={{ background: "#E6E1D6" }}>Cancel</button>
+            <button onClick={applyImport} disabled={!importPreview} className="text-xs px-3 py-2 rounded flex items-center gap-1 disabled:opacity-40" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 600 }}>
+              <Icon.check /> Apply import
+            </button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function TypeDetail({ type, months, series, scrollStart, setScrollStart, visibleMonths, getRow, setRow, startingBOM, setStartingBOM, chartData }) {
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+        <div style={{ fontFamily: "'Roboto Slab', serif" }} className="text-sm font-bold">{type}</div>
+        <label className="text-xs flex items-center gap-1.5">
+          Starting Actual BOM $
+          <input type="number" value={startingBOM ?? 0} onChange={(e) => setStartingBOM(Number(e.target.value))} className="w-24 border rounded px-1.5 py-1" style={{ borderColor: "#DCD5C4" }} />
+        </label>
+      </div>
+      <div className="mb-3"><MiniBarChart data={chartData} /></div>
+      <div className="flex items-center justify-between mb-1">
+        <button onClick={() => setScrollStart((s) => Math.max(0, s - 1))} disabled={scrollStart === 0} className="p-1 rounded disabled:opacity-30" style={{ background: "#F1EEE6" }}><Icon.chevronLeft /></button>
+        <span style={{ fontFamily: "'IBM Plex Mono', monospace" }} className="text-xs text-[#8B8F98]">{monthLabel(months[scrollStart])} – {monthLabel(months[Math.min(scrollStart + visibleMonths - 1, 11)])}</span>
+        <button onClick={() => setScrollStart((s) => Math.min(months.length - visibleMonths, s + 1))} disabled={scrollStart >= months.length - visibleMonths} className="p-1 rounded disabled:opacity-30" style={{ background: "#F1EEE6" }}><Icon.chevronRight /></button>
+      </div>
+      <div className="overflow-x-auto">
+        <table style={{ borderCollapse: "collapse", fontFamily: "'IBM Plex Mono', monospace" }} className="w-full text-xs">
+          <thead>
+            <tr>
+              <th className="text-left py-1.5 pr-3" style={{ color: "#8B8F98", minWidth: 150 }}>Line</th>
+              {months.slice(scrollStart, scrollStart + visibleMonths).map((m) => (<th key={m} className="text-right py-1.5 px-2" style={{ minWidth: 95 }}>{monthLabel(m)}</th>))}
+            </tr>
+          </thead>
+          <tbody>
+            {INPUT_FIELDS.map((f) => (
+              <tr key={f.key}>
+                <td className="py-1 pr-3" style={{ color: f.muted ? "#B0B4BC" : "#5C6270" }}>{f.label}</td>
+                {months.slice(scrollStart, scrollStart + visibleMonths).map((m) => {
+                  const row = getRow(type, m);
+                  return (
+                    <td key={m} className="py-1 px-1">
+                      <input type="number" value={row[f.key]} placeholder={f.muted ? "—" : "0"} onChange={(e) => setRow(type, m, { [f.key]: e.target.value === "" ? "" : Number(e.target.value) })} className="w-full text-right px-1 py-1 rounded border text-xs" style={{ borderColor: "#E6E1D6", color: f.muted ? "#8B8F98" : "#20232B" }} onClick={(e) => e.stopPropagation()} />
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+            <ReadRow label="Forecast Sales $" series={series} scrollStart={scrollStart} visibleMonths={visibleMonths} get={(s) => s.forecastSales} />
+            <ReadRow label="Forecast COGS $" series={series} scrollStart={scrollStart} visibleMonths={visibleMonths} get={(s) => s.forecastCOGS} />
+            <ReadRow label="BOM $ used" series={series} scrollStart={scrollStart} visibleMonths={visibleMonths} get={(s) => s.basis} sub={(s) => s.basisSource} />
+            <ReadRow label="Expected $ (recv+open PO)" series={series} scrollStart={scrollStart} visibleMonths={visibleMonths} get={(s) => s.expected} />
+            <ReadRow label="Target EOM $" series={series} scrollStart={scrollStart} visibleMonths={visibleMonths} get={(s) => s.targetEOM} bold />
+            <ReadRow label="WOS Target EOM $" series={series} scrollStart={scrollStart} visibleMonths={visibleMonths} get={(s) => s.wosTargetEOM} />
+            <ReadRow label="Over/Under $" series={series} scrollStart={scrollStart} visibleMonths={visibleMonths} get={(s) => s.overUnder} highlight />
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function ReadRow({ label, series, scrollStart, visibleMonths, get, sub, bold, highlight }) {
+  return (
+    <tr style={highlight ? { background: "#FBF6EA" } : {}}>
+      <td className="py-1 pr-3" style={{ color: "#20232B", fontWeight: bold || highlight ? 700 : 500 }}>{label}</td>
+      {series.slice(scrollStart, scrollStart + visibleMonths).map((s, i) => {
+        const v = get(s);
+        return (
+          <td key={i} className="py-1 px-2 text-right" style={{ fontWeight: bold || highlight ? 700 : 400, color: v < 0 ? "#B5432D" : "#20232B" }}>
+            {money(v)}
+            {sub && <div style={{ fontSize: 9, color: "#B0B4BC", fontWeight: 400 }}>{sub(s)}</div>}
+          </td>
+        );
+      })}
+    </tr>
+  );
+}
+
+function Modal({ children, onClose, title }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(27,32,39,0.6)" }}>
+      <div className="w-full max-w-lg rounded-md p-5 max-h-[90vh] overflow-y-auto" style={{ background: "#FFFFFF" }}>
+        <div className="flex items-center justify-between mb-3">
+          <div style={{ fontFamily: "'Roboto Slab', serif" }} className="font-bold text-lg">{title}</div>
+          <button onClick={onClose}><Icon.x /></button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<OTBEngine />);
+</script>
+</body>
+</html>
