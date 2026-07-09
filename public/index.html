@@ -185,6 +185,7 @@ function OTBEngine() {
   const [loaded, setLoaded] = useState(false);
   const [saveState, setSaveState] = useState("idle");
   const [filterSelection, setFilterSelection] = useState("all");
+  const [groupByCategory, setGroupByCategory] = useState(false);
   const [metric, setMetric] = useState("overUnder");
   const [showImport, setShowImport] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -592,6 +593,12 @@ function OTBEngine() {
   }
 
   const visibleMonthKeys = months.slice(scrollStart, scrollStart + visibleMonths);
+  function sumMetricForTypes(types, colIdx) {
+    if (metric === "buyAction") return null;
+    const monthIdx = scrollStart + colIdx;
+    return types.reduce((sum, t) => sum + (Number(metricValue(seriesByType[t][monthIdx], metric)) || 0), 0);
+  }
+  const filteredCategories = [...new Set(filteredTaxonomy.map(([, cat]) => cat))];
 
   return (
     <div style={{ background: "#F1EEE6", minHeight: "100vh", fontFamily: "'Inter', sans-serif", color: "#20232B" }}>
@@ -658,6 +665,10 @@ function OTBEngine() {
               {METRICS.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}
             </select>
           </label>
+          <label className="text-xs flex items-center gap-1.5" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
+            <input type="checkbox" checked={groupByCategory} onChange={(e) => setGroupByCategory(e.target.checked)} />
+            Group by category
+          </label>
           <div className="flex items-center gap-1">
             <button onClick={() => setScrollStart((s) => Math.max(0, s - 1))} disabled={scrollStart === 0} className="p-1.5 rounded disabled:opacity-30" style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }}><Icon.chevronLeft /></button>
             <span style={{ fontFamily: "'IBM Plex Mono', monospace" }} className="text-xs text-[#5C6270] w-28 text-center">{monthLabel(months[scrollStart])} – {monthLabel(months[Math.min(scrollStart + visibleMonths - 1, 11)])}</span>
@@ -679,7 +690,30 @@ function OTBEngine() {
                 </tr>
               </thead>
               <tbody>
-                {filteredTaxonomy.map(([type, cat]) => {
+                {groupByCategory ? (
+                  filteredCategories.map((cat) => {
+                    const typesInCat = filteredTaxonomy.filter(([, c]) => c === cat).map(([t]) => t);
+                    return (
+                      <tr key={cat} style={{ borderTop: "1px solid #EDE9DE" }}>
+                        <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#FFFFFF" }} className="py-2 px-3">
+                          <span className="flex items-center gap-1.5">
+                            <span style={{ width: 8, height: 8, borderRadius: 2, background: CATEGORY_COLOR[cat], flexShrink: 0 }} />
+                            <span style={{ fontSize: 11, color: "#5C6270" }}>{cat}</span>
+                          </span>
+                        </td>
+                        <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#FFFFFF", color: "#20232B", fontWeight: 600 }} className="py-2 px-3">All {typesInCat.length} types</td>
+                        {visibleMonthKeys.map((m, i) => {
+                          const v = sumMetricForTypes(typesInCat, i);
+                          if (v === null) return <td key={i} className="text-right py-2 px-3" style={{ color: "#B0B4BC" }}>—</td>;
+                          const cellColor = metric === "overUnder" ? (v > 0 ? "#5B7A5B" : v < 0 ? "#B5432D" : "#20232B") : (v < 0 ? "#B5432D" : "#20232B");
+                          return <td key={i} className="text-right py-2 px-3" style={{ color: cellColor, fontWeight: 600 }}>{money(v)}</td>;
+                        })}
+                        <td></td>
+                      </tr>
+                    );
+                  })
+                ) : (
+                  filteredTaxonomy.map(([type, cat]) => {
                   const series = seriesByType[type];
                   const isOpen = expandedType === type;
                   const rowBg = isOpen ? "#FAF8F3" : "#FFFFFF";
@@ -722,7 +756,21 @@ function OTBEngine() {
                       )}
                     </Fragment>
                   );
-                })}
+                  })
+                )}
+                {/* Grand total row across everything currently filtered/shown */}
+                <tr style={{ borderTop: "2px solid #20232B", background: "#F1EEE6" }}>
+                  <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#F1EEE6" }} className="py-2 px-3"></td>
+                  <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#F1EEE6", color: "#20232B", fontWeight: 700 }} className="py-2 px-3">TOTAL ({filteredTaxonomy.length} types)</td>
+                  {visibleMonthKeys.map((m, i) => {
+                    const allTypes = filteredTaxonomy.map(([t]) => t);
+                    const v = sumMetricForTypes(allTypes, i);
+                    if (v === null) return <td key={i} className="text-right py-2 px-3" style={{ color: "#B0B4BC" }}>—</td>;
+                    const cellColor = metric === "overUnder" ? (v > 0 ? "#5B7A5B" : v < 0 ? "#B5432D" : "#20232B") : (v < 0 ? "#B5432D" : "#20232B");
+                    return <td key={i} className="text-right py-2 px-3" style={{ color: cellColor, fontWeight: 700 }}>{money(v)}</td>;
+                  })}
+                  <td></td>
+                </tr>
               </tbody>
             </table>
           </div>
