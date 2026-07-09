@@ -116,6 +116,7 @@ app.get("/sales-by-type", async (req, res) => {
             edges {
               cursor
               node {
+                currentSubtotalPriceSet { shopMoney { amount } }
                 lineItems(first: 100) {
                   edges {
                     node {
@@ -137,12 +138,28 @@ app.get("/sales-by-type", async (req, res) => {
         const data = await shopifyGraphQL(query, { cursor, searchQuery });
         data.orders.edges.forEach(({ node, cursor: c }) => {
           cursor = c;
+          // Collect this order's non-gift-card lines first, so we can reconcile against the
+          // order's actual subtotal - catches order-level discounts (e.g. loyalty point
+          // redemptions) that don't show up on any individual line item's own discount field.
+          const orderLines = [];
+          let lineItemSum = 0;
           node.lineItems.edges.forEach(({ node: li }) => {
             if (li.isGiftCard) return; // gift card sales aren't revenue
             const type = li.product?.productType;
             const sales = parseFloat(li.discountedTotalSet.shopMoney.amount || 0);
             const unitCost = parseFloat(li.variant?.inventoryItem?.unitCost?.amount || 0);
-            addTotal(type, sales, unitCost * li.quantity);
+            const cogs = unitCost * li.quantity;
+            lineItemSum += sales;
+            orderLines.push({ type, sales, cogs });
+          });
+          const orderSubtotal = parseFloat(node.currentSubtotalPriceSet?.shopMoney?.amount ?? lineItemSum);
+          const extraDiscount = lineItemSum - orderSubtotal; // positive = order-level discount not captured per-line
+          orderLines.forEach((line) => {
+            let adjustedSales = line.sales;
+            if (extraDiscount > 0.01 && lineItemSum > 0) {
+              adjustedSales -= extraDiscount * (line.sales / lineItemSum);
+            }
+            addTotal(line.type, adjustedSales, line.cogs);
           });
         });
         hasNextPage = data.orders.pageInfo.hasNextPage;
