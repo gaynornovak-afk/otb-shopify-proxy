@@ -315,6 +315,24 @@ function OTBEngine() {
       error: (err) => { setImportError("Could not parse that CSV: " + err.message); setImportPreview(null); },
     });
   }
+  const MONTH_NAMES = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+  function parseMonthToKey(raw) {
+    const s = (raw || "").trim();
+    if (/^\d{4}-\d{1,2}$/.test(s)) { const [y, m] = s.split("-"); return `${y}-${m.padStart(2, "0")}`; }
+    let m = s.match(/^([A-Za-z]{3,9})[\s\-\/]?'?(\d{2,4})$/); // "Jul-26", "Jul 2026", "July/26"
+    if (m) {
+      const mon = MONTH_NAMES[m[1].slice(0, 3).toLowerCase()];
+      if (mon) { let yr = m[2]; if (yr.length === 2) yr = (Number(yr) < 50 ? "20" : "19") + yr; return `${yr}-${String(mon).padStart(2, "0")}`; }
+    }
+    m = s.match(/^'?(\d{2,4})[\s\-\/]([A-Za-z]{3,9})$/); // "26-Jul", "2026 Jul"
+    if (m) {
+      const mon = MONTH_NAMES[m[2].slice(0, 3).toLowerCase()];
+      if (mon) { let yr = m[1]; if (yr.length === 2) yr = (Number(yr) < 50 ? "20" : "19") + yr; return `${yr}-${String(mon).padStart(2, "0")}`; }
+    }
+    m = s.match(/^(\d{1,2})[\/\-](\d{4})$/); // "07/2026" or "07-2026"
+    if (m) return `${m[2]}-${m[1].padStart(2, "0")}`;
+    return s; // unrecognized - left as-is, row simply won't match a real month column
+  }
   function applyImport() {
     if (!importPreview) return;
     if (importFormat === "po") { applyPOImport(); return; }
@@ -326,8 +344,7 @@ function OTBEngine() {
         const mRaw = (r["Month"] || "").trim();
         if (!typeName || !mRaw || !validTypes.has(typeName.toLowerCase())) return;
         const match = TAXONOMY.find((t) => t[0].toLowerCase() === typeName.toLowerCase())[0];
-        let mKey = mRaw;
-        if (/^\d{4}-\d{1,2}$/.test(mRaw)) { const [y, m] = mRaw.split("-"); mKey = `${y}-${m.padStart(2, "0")}`; }
+        let mKey = parseMonthToKey(mRaw);
         const typeData = { ...(next[match] || {}) };
         const existing = typeData[mKey] || emptyRow();
         const patch = {};
