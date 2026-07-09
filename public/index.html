@@ -200,26 +200,46 @@ function OTBEngine() {
   const visibleMonths = 6;
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        setAssumptions(parsed.assumptions || {});
-        setStartingBOM(parsed.startingBOM || {});
-        setData(parsed.data || {});
+    (async () => {
+      try {
+        const res = await fetch("/state").then((r) => r.json());
+        if (res.value) {
+          const parsed = JSON.parse(res.value);
+          setAssumptions(parsed.assumptions || {});
+          setStartingBOM(parsed.startingBOM || {});
+          setData(parsed.data || {});
+          setLoaded(true);
+          return;
+        }
+        if (res.error) throw new Error(res.error);
+      } catch (e) {
+        // Server storage unreachable or not configured yet - fall back to this browser's local copy.
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            setAssumptions(parsed.assumptions || {});
+            setStartingBOM(parsed.startingBOM || {});
+            setData(parsed.data || {});
+          }
+        } catch (e2) { /* first run */ }
       }
-    } catch (e) { /* first run */ }
-    setLoaded(true);
+      setLoaded(true);
+    })();
   }, []);
 
   useEffect(() => {
     if (!loaded) return;
     setSaveState("saving");
-    const t = setTimeout(() => {
+    const t = setTimeout(async () => {
+      const payload = { assumptions, startingBOM, data };
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({ assumptions, startingBOM, data }));
-        setSaveState("saved");
-      } catch (e) { setSaveState("error"); }
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(payload)); // always keep a local backup copy too
+      } catch (e) { /* ignore quota errors */ }
+      try {
+        const res = await fetch("/state", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }).then((r) => r.json());
+        setSaveState(res.ok ? "saved" : "saved locally only");
+      } catch (e) { setSaveState("saved locally only"); }
     }, 400);
     return () => clearTimeout(t);
   }, [assumptions, startingBOM, data, loaded]);
@@ -578,7 +598,7 @@ function OTBEngine() {
           <div>
             <div style={{ fontFamily: "'Roboto Slab', serif", color: "#F1EEE6" }} className="text-xl sm:text-2xl font-bold">OTB ENGINE</div>
             <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-xs mt-1">
-              category · product type · 12 months · {saveState === "saving" ? "saving…" : saveState === "saved" ? "saved" : ""}
+              category · product type · 12 months · {saveState === "saving" ? "saving…" : saveState === "saved" ? "saved (synced)" : saveState === "saved locally only" ? "saved on this device only - set up server storage to sync across devices" : ""}
             </div>
           </div>
           <div className="flex gap-2">

@@ -50,6 +50,37 @@ async function shopifyGraphQL(query, variables) {
 
 app.get("/health", (req, res) => res.json({ ok: true, store: STORE }));
 
+// Server-side app state (so the same data shows up on every device/browser).
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const STATE_KEY = "otb-app-state";
+async function upstash(command) {
+  const res = await fetch(UPSTASH_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(command),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data.result;
+}
+app.get("/state", async (req, res) => {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return res.status(501).json({ error: "Server-side storage isn't configured (missing UPSTASH_REDIS_REST_URL/TOKEN)." });
+  try {
+    const value = await upstash(["GET", STATE_KEY]);
+    res.json({ value: value || null });
+  } catch (err) { res.status(500).json({ error: String(err.message || err) }); }
+});
+app.use(express.json({ limit: "5mb" }));
+app.post("/state", async (req, res) => {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return res.status(501).json({ error: "Server-side storage isn't configured (missing UPSTASH_REDIS_REST_URL/TOKEN)." });
+  try {
+    const value = JSON.stringify(req.body);
+    await upstash(["SET", STATE_KEY, value]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: String(err.message || err) }); }
+});
+
 // GET /sales-by-type?start=2026-07-01&end=2026-07-31
 // Returns { "1101 Tees/Tunics Solid": { sales: 1234.56, cogs: 567.89 }, ... }
 app.get("/sales-by-type", async (req, res) => {
