@@ -184,7 +184,7 @@ function OTBEngine() {
   const [scrollStart, setScrollStart] = useState(0);
   const [loaded, setLoaded] = useState(false);
   const [saveState, setSaveState] = useState("idle");
-  const [filterText, setFilterText] = useState("");
+  const [filterSelection, setFilterSelection] = useState("all");
   const [metric, setMetric] = useState("overUnder");
   const [showImport, setShowImport] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -301,7 +301,9 @@ function OTBEngine() {
     return m;
   }, [data, assumptions, startingBOM, months]);
 
-  const filteredTaxonomy = TAXONOMY.filter(([type, cat]) => (cat + " " + type).toLowerCase().includes(filterText.toLowerCase()));
+  const filteredTaxonomy = filterSelection === "all" ? TAXONOMY
+    : filterSelection.startsWith("cat:") ? TAXONOMY.filter(([, cat]) => cat === filterSelection.slice(4))
+    : TAXONOMY.filter(([type]) => type === filterSelection.slice(5));
 
   function categoryBuyTotal(cat, monthIdx) {
     return TYPES_BY_CATEGORY[cat].reduce((sum, t) => sum + Math.max(seriesByType[t][monthIdx].overUnder, 0), 0);
@@ -530,17 +532,37 @@ function OTBEngine() {
       const res = await fetch(`/inventory-by-type`).then((r) => r.json());
       if (res.error) throw new Error(res.error);
       let matched = 0;
-      const mStr = months[monthCursor];
       TAXONOMY.forEach(([type]) => {
         const t = res.totals?.[type];
         if (!t) return;
         matched++;
-        if (monthCursor === 0) setStartingBOM((prev) => ({ ...prev, [type]: Number(t.value.toFixed(2)) }));
-        else setRow(type, mStr, { actualBOMOverride: Number(t.value.toFixed(2)) });
+        // Inventory sync always sets the Starting Actual BOM $ (your "right now" position),
+        // regardless of which month is on screen - it's a live snapshot, not tied to a
+        // future month's plan.
+        setStartingBOM((prev) => ({ ...prev, [type]: Number(t.value.toFixed(2)) }));
       });
-      setSyncStatus(`Synced current inventory value for ${matched} of ${TAXONOMY.length} product types.`);
+      setSyncStatus(`Set starting inventory for ${matched} of ${TAXONOMY.length} product types.`);
     } catch (e) { setSyncStatus("Sync failed: " + e.message); }
     setSyncing(false);
+  }
+  function clearStrayBOMOverrides() {
+    let cleared = 0;
+    setData((prev) => {
+      const next = { ...prev };
+      TAXONOMY.forEach(([type]) => {
+        const typeData = { ...(next[type] || {}) };
+        months.slice(1).forEach((mKey) => {
+          const row = typeData[mKey];
+          if (row && row.actualBOMOverride !== "" && row.actualBOMOverride !== undefined) {
+            cleared++;
+            typeData[mKey] = { ...row, actualBOMOverride: "" };
+          }
+        });
+        next[type] = typeData;
+      });
+      return next;
+    });
+    setSyncStatus(`Cleared ${cleared} stray BOM override(s).`);
   }
 
   if (!loaded) {
@@ -598,7 +620,15 @@ function OTBEngine() {
         <div className="flex flex-wrap items-center gap-3 mb-3">
           <div className="flex items-center gap-2 px-2 py-1.5 rounded border flex-1 min-w-[200px]" style={{ borderColor: "#DCD5C4", background: "#FFFFFF" }}>
             <Icon.search />
-            <input value={filterText} onChange={(e) => setFilterText(e.target.value)} placeholder="Filter by category or product type…" className="text-xs flex-1 outline-none" style={{ background: "transparent" }} />
+            <select value={filterSelection} onChange={(e) => setFilterSelection(e.target.value)} className="text-xs flex-1 outline-none" style={{ background: "transparent" }}>
+              <option value="all">All categories & product types</option>
+              {CATEGORIES.map((c) => (
+                <optgroup key={c} label={c}>
+                  <option value={`cat:${c}`}>— all of {c} —</option>
+                  {TYPES_BY_CATEGORY[c].map((t) => <option key={t} value={`type:${t}`}>{t}</option>)}
+                </optgroup>
+              ))}
+            </select>
           </div>
           <label className="text-xs flex items-center gap-1.5" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
             Show
@@ -644,7 +674,7 @@ function OTBEngine() {
                         {series.slice(scrollStart, scrollStart + visibleMonths).map((s, i) => {
                           const v = metricValue(s, metric);
                           if (metric === "buyAction") {
-                            const actionColor = v === "Buy" ? "#8C6E4A" : v === "Don't Buy" ? "#B5432D" : "#5B7A5B";
+                            const actionColor = v === "Buy" ? "#5B7A5B" : v === "Don't Buy" ? "#B5432D" : "#8C6E4A";
                             return <td key={i} className="text-right py-2 px-3"><span className="px-2 py-0.5 rounded-full text-[10px]" style={{ background: `${actionColor}22`, color: actionColor, fontWeight: 700 }}>{v}</span></td>;
                           }
                           return <td key={i} className="text-right py-2 px-3" style={{ color: v < 0 ? "#B5432D" : "#20232B" }}>{money(v)}</td>;
@@ -692,7 +722,7 @@ function OTBEngine() {
             <button onClick={testConnection} className="text-xs px-3 py-1.5 rounded" style={{ background: "#E6E1D6" }}>Test connection</button>
           </div>
           <div className="p-3 rounded mb-3" style={{ background: "#F1EEE6" }}>
-            <div className="text-xs mb-2" style={{ color: "#5C6270" }}>Syncing into: <b>{monthLabel(months[monthCursor])}</b> (change the month with the dashboard arrows before syncing)</div>
+            <div className="text-xs mb-2" style={{ color: "#5C6270" }}>Sales & COGS sync into: <b>{monthLabel(months[monthCursor])}</b> (change with the dashboard arrows). Inventory sync always sets your Starting Actual BOM $, regardless of month shown.</div>
             <div className="flex gap-2 flex-wrap">
               <button onClick={syncSales} disabled={syncing} className="text-xs px-3 py-2 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
                 <Icon.refresh /> Sync Sales & COGS
@@ -701,6 +731,12 @@ function OTBEngine() {
                 <Icon.refresh /> Sync Inventory
               </button>
             </div>
+          </div>
+          <div className="p-3 rounded mb-3" style={{ background: "#FBF6EA" }}>
+            <div className="text-xs mb-2" style={{ color: "#5C6270" }}>If Inventory sync was run earlier while viewing a future month, it may have left stray $0 (or other) overrides sitting in "Actual BOM $ (override)" for months after July. This clears those out (leaves July's Starting BOM untouched) so those months roll forward normally again.</div>
+            <button onClick={clearStrayBOMOverrides} className="text-xs px-3 py-2 rounded flex items-center gap-1.5" style={{ background: "#B5432D", color: "#FBF6EA" }}>
+              Clear stray BOM overrides (Aug onward)
+            </button>
           </div>
           {syncStatus && <div className="text-xs" style={{ color: syncStatus.startsWith("Sync failed") || syncStatus.startsWith("Could not") ? "#B5432D" : "#5B7A5B" }}>{syncStatus}</div>}
           <div className="flex justify-end mt-4">
