@@ -83,6 +83,9 @@ app.post("/state", async (req, res) => {
 
 // GET /sales-by-type?start=2026-07-01&end=2026-07-31
 // Returns { "1101 Tees/Tunics Solid": { sales: 1234.56, cogs: 567.89 }, ... }
+// Gross sales are attributed to the month the order was CREATED. Returns are attributed to
+// the month the REFUND actually happened, even if the original order was created in an
+// earlier month - matching how Shopify's own Net Sales report works.
 app.get("/sales-by-type", async (req, res) => {
   const { start, end } = req.query;
   if (!start || !end) return res.status(400).json({ error: "start and end (YYYY-MM-DD) are required" });
@@ -94,72 +97,110 @@ app.get("/sales-by-type", async (req, res) => {
     totals[type].sales += sales;
     totals[type].cogs += cogs;
   }
+  function inRange(isoDateTime) {
+    const d = (isoDateTime || "").slice(0, 10);
+    return d >= start && d <= end;
+  }
 
-  const searchQuery = `created_at:>=${start} AND created_at:<=${end}`;
-  let cursor = null;
-  let hasNextPage = true;
-  let pages = 0;
-  const MAX_PAGES = 40; // safety cap ~2000 orders
+  const MAX_PAGES = 40; // safety cap ~2000 orders per pass
+  let truncated = false;
 
-  const query = `
-    query($cursor: String, $searchQuery: String!) {
-      orders(first: 50, after: $cursor, query: $searchQuery) {
-        edges {
-          cursor
-          node {
-            lineItems(first: 100) {
-              edges {
-                node {
-                  quantity
-                  discountedTotalSet { shopMoney { amount } }
-                  product { productType }
-                  variant { inventoryItem { unitCost { amount } } }
-                }
-              }
-            }
-            refunds {
-              refundLineItems(first: 100) {
-                edges {
-                  node {
-                    quantity
-                    subtotalSet { shopMoney { amount } }
-                    lineItem { product { productType } }
+  try {
+    // Pass 1: gross sales - orders CREATED in this window
+    {
+      const searchQuery = `created_at:>=${start} AND created_at:<=${end} AND -status:cancelled`;
+      let cursor = null, hasNextPage = true, pages = 0;
+      const query = `
+        query($cursor: String, $searchQuery: String!) {
+          orders(first: 50, after: $cursor, query: $searchQuery) {
+            edges {
+              cursor
+              node {
+                lineItems(first: 100) {
+                  edges {
+                    node {
+                      quantity
+                      isGiftCard
+                      discountedTotalSet { shopMoney { amount } }
+                      product { productType }
+                      variant { inventoryItem { unitCost { amount } } }
+                    }
                   }
                 }
               }
             }
+            pageInfo { hasNextPage }
           }
         }
-        pageInfo { hasNextPage }
-      }
-    }
-  `;
-
-  try {
-    while (hasNextPage && pages < MAX_PAGES) {
-      const data = await shopifyGraphQL(query, { cursor, searchQuery });
-      const edges = data.orders.edges;
-      edges.forEach(({ node, cursor: c }) => {
-        cursor = c;
-        node.lineItems.edges.forEach(({ node: li }) => {
-          const type = li.product?.productType;
-          const sales = parseFloat(li.discountedTotalSet.shopMoney.amount || 0);
-          const unitCost = parseFloat(li.variant?.inventoryItem?.unitCost?.amount || 0);
-          const cogs = unitCost * li.quantity;
-          addTotal(type, sales, cogs);
-        });
-        node.refunds.forEach((refund) => {
-          refund.refundLineItems.edges.forEach(({ node: rli }) => {
-            const type = rli.lineItem?.product?.productType;
-            const refundAmt = parseFloat(rli.subtotalSet.shopMoney.amount || 0);
-            addTotal(type, -refundAmt, 0);
+      `;
+      while (hasNextPage && pages < MAX_PAGES) {
+        const data = await shopifyGraphQL(query, { cursor, searchQuery });
+        data.orders.edges.forEach(({ node, cursor: c }) => {
+          cursor = c;
+          node.lineItems.edges.forEach(({ node: li }) => {
+            if (li.isGiftCard) return; // gift card sales aren't revenue
+            const type = li.product?.productType;
+            const sales = parseFloat(li.discountedTotalSet.shopMoney.amount || 0);
+            const unitCost = parseFloat(li.variant?.inventoryItem?.unitCost?.amount || 0);
+            addTotal(type, sales, unitCost * li.quantity);
           });
         });
-      });
-      hasNextPage = data.orders.pageInfo.hasNextPage;
-      pages++;
+        hasNextPage = data.orders.pageInfo.hasNextPage;
+        pages++;
+      }
+      if (hasNextPage) truncated = true;
     }
-    res.json({ totals, truncated: hasNextPage, pagesScanned: pages });
+
+    // Pass 2: returns - any order UPDATED in this window (catches orders created in a prior
+    // month but refunded now), subtracting only the refunds whose own date falls in-window.
+    {
+      const searchQuery = `updated_at:>=${start} AND updated_at:<=${end} AND -status:cancelled`;
+      let cursor = null, hasNextPage = true, pages = 0;
+      const query = `
+        query($cursor: String, $searchQuery: String!) {
+          orders(first: 50, after: $cursor, query: $searchQuery) {
+            edges {
+              cursor
+              node {
+                refunds {
+                  createdAt
+                  refundLineItems(first: 100) {
+                    edges {
+                      node {
+                        quantity
+                        subtotalSet { shopMoney { amount } }
+                        lineItem { isGiftCard product { productType } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            pageInfo { hasNextPage }
+          }
+        }
+      `;
+      while (hasNextPage && pages < MAX_PAGES) {
+        const data = await shopifyGraphQL(query, { cursor, searchQuery });
+        data.orders.edges.forEach(({ node, cursor: c }) => {
+          cursor = c;
+          node.refunds.forEach((refund) => {
+            if (!inRange(refund.createdAt)) return; // refund happened outside this window - skip
+            refund.refundLineItems.edges.forEach(({ node: rli }) => {
+              if (rli.lineItem?.isGiftCard) return;
+              const type = rli.lineItem?.product?.productType;
+              const refundAmt = parseFloat(rli.subtotalSet.shopMoney.amount || 0);
+              addTotal(type, -refundAmt, 0);
+            });
+          });
+        });
+        hasNextPage = data.orders.pageInfo.hasNextPage;
+        pages++;
+      }
+      if (hasNextPage) truncated = true;
+    }
+
+    res.json({ totals, truncated });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: String(err.message || err) });
