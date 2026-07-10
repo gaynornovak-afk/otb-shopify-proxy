@@ -189,6 +189,9 @@ function OTBEngine() {
   const [metric, setMetric] = useState("overUnder");
   const [showImport, setShowImport] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [growthSuggestions, setGrowthSuggestions] = useState({});
+  const [suggestionsStatus, setSuggestionsStatus] = useState("");
+  const [calculatingSuggestions, setCalculatingSuggestions] = useState(false);
   const [showSync, setShowSync] = useState(false);
   const [syncStatus, setSyncStatus] = useState("");
   const [syncing, setSyncing] = useState(false);
@@ -568,6 +571,57 @@ function OTBEngine() {
     } catch (e) { setSyncStatus("Sync failed: " + e.message); }
     setSyncing(false);
   }
+  // Suggests a Growth % per category based on the last 3 completed calendar months'
+  // actual sales vs. the same 3 months a year earlier - a data-driven starting point
+  // instead of guessing, using sales data already flowing through the live sync.
+  async function calculateGrowthSuggestions() {
+    setCalculatingSuggestions(true);
+    setSuggestionsStatus("Calculating from trailing 3 months of actual sales…");
+    try {
+      const now = new Date();
+      now.setDate(1);
+      const trailingMonths = [];
+      for (let i = 3; i >= 1; i--) {
+        const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+        trailingMonths.push(d);
+      }
+      async function sumSalesForMonths(dates) {
+        const results = await Promise.all(dates.map((d) => {
+          const y = d.getFullYear(), m = d.getMonth() + 1;
+          const lastDay = new Date(y, m, 0).getDate();
+          const start = `${y}-${String(m).padStart(2, "0")}-01`;
+          const end = `${y}-${String(m).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+          return fetch(`/sales-by-type?start=${start}&end=${end}`).then((r) => r.json());
+        }));
+        const byType = {};
+        results.forEach((res) => {
+          if (res.error) throw new Error(res.error);
+          Object.entries(res.totals || {}).forEach(([type, t]) => {
+            byType[type] = (byType[type] || 0) + t.sales;
+          });
+        });
+        return byType;
+      }
+      const lyMonths = trailingMonths.map((d) => new Date(d.getFullYear() - 1, d.getMonth(), 1));
+      const [thisYear, lastYear] = await Promise.all([sumSalesForMonths(trailingMonths), sumSalesForMonths(lyMonths)]);
+
+      const catThis = {}, catLast = {};
+      TAXONOMY.forEach(([type, cat]) => {
+        catThis[cat] = (catThis[cat] || 0) + (thisYear[type] || 0);
+        catLast[cat] = (catLast[cat] || 0) + (lastYear[type] || 0);
+      });
+      const suggestions = {};
+      CATEGORIES.forEach((cat) => {
+        if (catLast[cat] > 0) suggestions[cat] = Math.round(((catThis[cat] / catLast[cat]) - 1) * 1000) / 10;
+      });
+      setGrowthSuggestions(suggestions);
+      setSuggestionsStatus(`Done - based on ${monthLabel(`${trailingMonths[0].getFullYear()}-${String(trailingMonths[0].getMonth()+1).padStart(2,"0")}`)} through ${monthLabel(`${trailingMonths[2].getFullYear()}-${String(trailingMonths[2].getMonth()+1).padStart(2,"0")}`)} vs the same months last year.`);
+    } catch (e) {
+      setSuggestionsStatus("Could not calculate: " + e.message);
+    }
+    setCalculatingSuggestions(false);
+  }
+
   function clearStrayBOMOverrides() {
     let cleared = 0;
     setData((prev) => {
@@ -818,14 +872,27 @@ function OTBEngine() {
 
       {showSettings && (
         <Modal onClose={() => setShowSettings(false)} title="Category assumptions">
+          <div className="p-3 rounded mb-3" style={{ background: "#F1EEE6" }}>
+            <div className="text-xs mb-2" style={{ color: "#5C6270" }}>Suggests a Growth % per category from your actual trailing 3 months of sales vs. the same 3 months last year - a data-driven starting point instead of a guess.</div>
+            <button onClick={calculateGrowthSuggestions} disabled={calculatingSuggestions} className="text-xs px-3 py-2 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
+              <Icon.refresh /> {calculatingSuggestions ? "Calculating…" : "Calculate suggested growth %"}
+            </button>
+            {suggestionsStatus && <div className="text-xs mt-2" style={{ color: suggestionsStatus.startsWith("Could not") ? "#B5432D" : "#5B7A5B" }}>{suggestionsStatus}</div>}
+          </div>
           <div className="space-y-2 max-h-96 overflow-y-auto">
             {CATEGORIES.map((c) => {
               const a = getAssumptions(c);
+              const suggestion = growthSuggestions[c];
               return (
                 <div key={c} className="flex items-center gap-2 p-2 rounded border text-xs flex-wrap" style={{ borderColor: "#DCD5C4" }}>
                   <span style={{ width: 9, height: 9, borderRadius: 2, background: CATEGORY_COLOR[c], flexShrink: 0 }} />
                   <span className="flex-1 min-w-[140px]" style={{ fontWeight: 500 }}>{c}</span>
                   <label className="flex items-center gap-1">Growth % <input type="number" value={a.growthPct} onChange={(e) => setAssumption(c, { growthPct: Number(e.target.value) })} className="w-14 border rounded px-1 py-1" style={{ borderColor: "#DCD5C4" }} /></label>
+                  {suggestion !== undefined && (
+                    <button onClick={() => setAssumption(c, { growthPct: suggestion })} className="px-2 py-1 rounded text-[10px]" style={{ background: "#FBF6EA", color: "#8C6E4A", fontWeight: 600 }} title="Click to apply this suggestion">
+                      Suggested: {suggestion > 0 ? "+" : ""}{suggestion}%
+                    </button>
+                  )}
                   <label className="flex items-center gap-1">WOS <input type="number" value={a.wosTarget} onChange={(e) => setAssumption(c, { wosTarget: Number(e.target.value) })} className="w-14 border rounded px-1 py-1" style={{ borderColor: "#DCD5C4" }} /></label>
                   <label className="flex items-center gap-1">GM % <input type="number" value={a.gmPct} onChange={(e) => setAssumption(c, { gmPct: Number(e.target.value) })} className="w-14 border rounded px-1 py-1" style={{ borderColor: "#DCD5C4" }} /></label>
                 </div>
