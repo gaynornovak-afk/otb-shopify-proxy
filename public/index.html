@@ -194,11 +194,14 @@ function OTBEngine() {
   const [calculatingSuggestions, setCalculatingSuggestions] = useState(false);
   const [showSync, setShowSync] = useState(false);
   const [showVendors, setShowVendors] = useState(false);
-  const [vendorReport, setVendorReport] = useState(null);
+  const [vendorTable, setVendorTable] = useState(null); // { vendor: { mStr: {sales, cogs, actualMarginPct, plannedMarginPct, marginDiff} } }
+  const [vendorMonths, setVendorMonths] = useState([]); // array of "YYYY-MM" strings, loaded range
   const [vendorStatus, setVendorStatus] = useState("");
   const [loadingVendors, setLoadingVendors] = useState(false);
   const [vendorSort, setVendorSort] = useState("sales");
-  const [vendorMonthOffset, setVendorMonthOffset] = useState(0); // 0 = current month, negative = past, positive = future
+  const [vendorMetric, setVendorMetric] = useState("sales"); // which metric fills the month columns
+  const [vendorMonthOffset, setVendorMonthOffset] = useState(0); // 0 = current month, negative = past, positive = future - this is the END of the loaded range
+  const [vendorRangeSize, setVendorRangeSize] = useState(6); // how many months back from the offset to load
   const [syncStatus, setSyncStatus] = useState("");
   const [syncing, setSyncing] = useState(false);
   const [importText, setImportText] = useState("");
@@ -559,40 +562,51 @@ function OTBEngine() {
   }
   async function loadVendorReport() {
     setLoadingVendors(true);
-    const targetDate = new Date();
-    targetDate.setDate(1);
-    targetDate.setMonth(targetDate.getMonth() + vendorMonthOffset);
-    const mStr = `${targetDate.getFullYear()}-${String(targetDate.getMonth() + 1).padStart(2, "0")}`;
-    setVendorStatus(`Loading vendor performance for ${monthLabel(mStr)}…`);
+    const monthDates = [];
+    for (let i = vendorRangeSize - 1; i >= 0; i--) {
+      const d = new Date();
+      d.setDate(1);
+      d.setMonth(d.getMonth() + vendorMonthOffset - i);
+      monthDates.push(d);
+    }
+    const mStrs = monthDates.map((d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`);
+    setVendorStatus(`Loading vendor performance for ${monthLabel(mStrs[0])} – ${monthLabel(mStrs[mStrs.length - 1])}…`);
     try {
-      const [y, m] = mStr.split("-").map(Number);
-      const lastDay = new Date(y, m, 0).getDate();
-      const start = `${mStr}-01`;
-      const end = `${mStr}-${String(lastDay).padStart(2, "0")}`;
-      const res = await fetch(`/vendor-report?start=${start}&end=${end}`).then((r) => r.json());
-      if (res.error) throw new Error(res.error);
-
+      const results = await Promise.all(mStrs.map((mStr) => {
+        const [y, m] = mStr.split("-").map(Number);
+        const lastDay = new Date(y, m, 0).getDate();
+        const start = `${mStr}-01`, end = `${mStr}-${String(lastDay).padStart(2, "0")}`;
+        return fetch(`/vendor-report?start=${start}&end=${end}`).then((r) => r.json());
+      }));
       const typeToCat = Object.fromEntries(TAXONOMY);
-      const rows = Object.entries(res.vendors || {}).map(([vendor, v]) => {
-        const actualMarginPct = v.sales > 0 ? ((v.sales - v.cogs) / v.sales) * 100 : null;
-        // Planned margin: sales-weighted average of each category's GM% assumption,
-        // weighted by how much of this vendor's sales fell into each category.
-        let weightedGM = 0, weightTotal = 0;
-        Object.entries(v.byType).forEach(([type, t]) => {
-          const cat = typeToCat[type];
-          const gm = getAssumptions(cat).gmPct;
-          weightedGM += gm * t.sales;
-          weightTotal += t.sales;
+      const vendorSet = new Set();
+      results.forEach((res) => { if (!res.error) Object.keys(res.vendors || {}).forEach((v) => vendorSet.add(v)); });
+      const table = {};
+      vendorSet.forEach((v) => { table[v] = {}; });
+      let anyTruncated = false;
+      mStrs.forEach((mStr, idx) => {
+        const res = results[idx];
+        if (res.error) return; // tolerate a single bad month rather than failing the whole range
+        if (res.truncated) anyTruncated = true;
+        Object.entries(res.vendors || {}).forEach(([vendor, v]) => {
+          const actualMarginPct = v.sales > 0 ? ((v.sales - v.cogs) / v.sales) * 100 : null;
+          let weightedGM = 0, weightTotal = 0;
+          Object.entries(v.byType).forEach(([type, t]) => {
+            const cat = typeToCat[type];
+            const gm = getAssumptions(cat).gmPct;
+            weightedGM += gm * t.sales;
+            weightTotal += t.sales;
+          });
+          const plannedMarginPct = weightTotal > 0 ? weightedGM / weightTotal : null;
+          table[vendor][mStr] = {
+            sales: v.sales, cogs: v.cogs, actualMarginPct, plannedMarginPct,
+            marginDiff: actualMarginPct !== null && plannedMarginPct !== null ? actualMarginPct - plannedMarginPct : null,
+          };
         });
-        const plannedMarginPct = weightTotal > 0 ? weightedGM / weightTotal : null;
-        return {
-          vendor, sales: v.sales, cogs: v.cogs,
-          actualMarginPct, plannedMarginPct,
-          marginDiff: actualMarginPct !== null && plannedMarginPct !== null ? actualMarginPct - plannedMarginPct : null,
-        };
       });
-      setVendorReport(rows);
-      setVendorStatus(`Loaded ${rows.length} vendors for ${monthLabel(mStr)}.${res.truncated ? " (large order history - some may be missing)" : ""}`);
+      setVendorMonths(mStrs);
+      setVendorTable(table);
+      setVendorStatus(`Loaded ${vendorSet.size} vendors across ${mStrs.length} months.${anyTruncated ? " (large order history in at least one month - some data may be missing)" : ""}`);
     } catch (e) {
       setVendorStatus("Failed to load: " + e.message);
     }
@@ -924,51 +938,75 @@ function OTBEngine() {
       {showVendors && (
         <Modal onClose={() => setShowVendors(false)} title="Vendor performance">
           <p className="text-sm mb-3" style={{ color: "#5C6270" }}>
-            Actual margin comes from real synced sales & COGS by vendor. Planned margin is a sales-weighted average of the GM% assumptions for whatever categories that vendor's products fall into. Use the arrows below to look at any month, forward or back - though going back more than ~60 days may come back empty if your Shopify app doesn't have extended order history access yet.
+            Actual margin comes from real synced sales & COGS. Planned margin is a sales-weighted average of the GM% assumptions for whatever categories that vendor's products fall into. Going back more than ~60 days may come back empty until your Shopify app has extended order history access.
           </p>
-          <div className="flex items-center gap-2 mb-3 flex-wrap">
+          <div className="flex items-center gap-3 mb-3 flex-wrap">
             <div className="flex items-center gap-2">
               <button onClick={() => setVendorMonthOffset((o) => o - 1)} className="p-1 rounded" style={{ background: "#F1EEE6" }}><Icon.chevronLeft /></button>
               <span className="text-xs" style={{ color: "#5C6270" }}>
-                Month: <b>{(() => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + vendorMonthOffset); return monthLabel(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`); })()}</b>
+                Ending: <b>{(() => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + vendorMonthOffset); return monthLabel(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`); })()}</b>
               </span>
               <button onClick={() => setVendorMonthOffset((o) => o + 1)} className="p-1 rounded" style={{ background: "#F1EEE6" }}><Icon.chevronRight /></button>
             </div>
+            <label className="text-xs flex items-center gap-1.5">
+              Show last
+              <input type="number" min="1" max="12" value={vendorRangeSize} onChange={(e) => setVendorRangeSize(Math.max(1, Math.min(12, Number(e.target.value))))} className="w-12 border rounded px-1 py-1" style={{ borderColor: "#DCD5C4" }} />
+              months
+            </label>
+            <label className="text-xs flex items-center gap-1.5">
+              Metric
+              <select value={vendorMetric} onChange={(e) => setVendorMetric(e.target.value)} className="border rounded px-2 py-1 text-xs" style={{ borderColor: "#DCD5C4" }}>
+                <option value="sales">Sales $</option>
+                <option value="cogs">COGS $</option>
+                <option value="actualMarginPct">Actual Margin %</option>
+                <option value="plannedMarginPct">Planned Margin %</option>
+                <option value="marginDiff">Diff vs Planned</option>
+              </select>
+            </label>
             <button onClick={loadVendorReport} disabled={loadingVendors} className="text-xs px-3 py-2 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
-              <Icon.refresh /> {loadingVendors ? "Loading…" : "Load vendor performance"}
+              <Icon.refresh /> {loadingVendors ? "Loading…" : "Load"}
             </button>
           </div>
           {vendorStatus && <div className="text-xs mb-3" style={{ color: vendorStatus.startsWith("Failed") ? "#B5432D" : "#5B7A5B" }}>{vendorStatus}</div>}
-          {vendorReport && (
-            <div className="overflow-x-auto max-h-96 overflow-y-auto border rounded" style={{ borderColor: "#DCD5C4" }}>
-              <table style={{ borderCollapse: "collapse", fontFamily: "'IBM Plex Mono', monospace" }} className="w-full text-xs">
+          {vendorTable && vendorMonths.length > 0 && (
+            <div className="overflow-auto border rounded" style={{ borderColor: "#DCD5C4", maxHeight: "60vh" }}>
+              <table style={{ borderCollapse: "collapse", fontFamily: "'IBM Plex Mono', monospace", width: "max-content", minWidth: "100%" }} className="text-xs">
                 <thead>
-                  <tr style={{ position: "sticky", top: 0, background: "#20232B", color: "#EDE7DA" }}>
-                    <th className="text-left py-2 px-2 cursor-pointer" onClick={() => setVendorSort("vendor")}>Vendor</th>
-                    <th className="text-right py-2 px-2 cursor-pointer" onClick={() => setVendorSort("sales")}>Sales $</th>
-                    <th className="text-right py-2 px-2 cursor-pointer" onClick={() => setVendorSort("cogs")}>COGS $</th>
-                    <th className="text-right py-2 px-2 cursor-pointer" onClick={() => setVendorSort("actualMarginPct")}>Actual Margin</th>
-                    <th className="text-right py-2 px-2 cursor-pointer" onClick={() => setVendorSort("plannedMarginPct")}>Planned Margin</th>
-                    <th className="text-right py-2 px-2 cursor-pointer" onClick={() => setVendorSort("marginDiff")}>Diff</th>
+                  <tr>
+                    <th style={{ position: "sticky", top: 0, left: 0, zIndex: 3, background: "#20232B", color: "#EDE7DA", minWidth: 160 }} className="text-left py-2 px-2 cursor-pointer" onClick={() => setVendorSort("vendor")}>Vendor</th>
+                    {vendorMonths.map((mStr) => (
+                      <th key={mStr} style={{ position: "sticky", top: 0, zIndex: 2, background: "#2A303B", color: "#EDE7DA", minWidth: 95 }} className="text-right py-2 px-2">{monthLabel(mStr)}</th>
+                    ))}
+                    <th style={{ position: "sticky", top: 0, zIndex: 2, background: "#2A303B", color: "#EDE7DA", minWidth: 95 }} className="text-right py-2 px-2 cursor-pointer" onClick={() => setVendorSort("total")}>Total Sales</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {[...vendorReport].sort((a, b) => {
-                    if (vendorSort === "vendor") return a.vendor.localeCompare(b.vendor);
-                    const av = a[vendorSort] ?? -Infinity, bv = b[vendorSort] ?? -Infinity;
-                    return bv - av;
-                  }).map((row, i) => (
-                    <tr key={i} style={{ borderTop: "1px solid #EDE9DE" }}>
-                      <td className="py-1.5 px-2" style={{ fontWeight: 500 }}>{row.vendor}</td>
-                      <td className="text-right py-1.5 px-2">{money(row.sales)}</td>
-                      <td className="text-right py-1.5 px-2">{money(row.cogs)}</td>
-                      <td className="text-right py-1.5 px-2">{row.actualMarginPct !== null ? row.actualMarginPct.toFixed(1) + "%" : "—"}</td>
-                      <td className="text-right py-1.5 px-2" style={{ color: "#8B8F98" }}>{row.plannedMarginPct !== null ? row.plannedMarginPct.toFixed(1) + "%" : "—"}</td>
-                      <td className="text-right py-1.5 px-2" style={{ color: row.marginDiff === null ? "#20232B" : row.marginDiff >= 0 ? "#5B7A5B" : "#B5432D", fontWeight: 600 }}>
-                        {row.marginDiff !== null ? (row.marginDiff >= 0 ? "+" : "") + row.marginDiff.toFixed(1) + "%" : "—"}
-                      </td>
-                    </tr>
-                  ))}
+                  {Object.entries(vendorTable)
+                    .map(([vendor, byMonth]) => {
+                      const totalSales = Object.values(byMonth).reduce((s, m) => s + (m.sales || 0), 0);
+                      return { vendor, byMonth, totalSales };
+                    })
+                    .sort((a, b) => {
+                      if (vendorSort === "vendor") return a.vendor.localeCompare(b.vendor);
+                      if (vendorSort === "total") return b.totalSales - a.totalSales;
+                      const aLast = Object.values(a.byMonth).slice(-1)[0]?.[vendorSort] ?? -Infinity;
+                      const bLast = Object.values(b.byMonth).slice(-1)[0]?.[vendorSort] ?? -Infinity;
+                      return bLast - aLast;
+                    })
+                    .map(({ vendor, byMonth, totalSales }) => (
+                      <tr key={vendor} style={{ borderTop: "1px solid #EDE9DE" }}>
+                        <td style={{ position: "sticky", left: 0, zIndex: 1, background: "#FFFFFF" }} className="py-1.5 px-2" >{vendor}</td>
+                        {vendorMonths.map((mStr) => {
+                          const cell = byMonth[mStr];
+                          const v = cell ? cell[vendorMetric] : null;
+                          const isPct = vendorMetric.toLowerCase().includes("pct") || vendorMetric === "marginDiff";
+                          const display = v === null || v === undefined ? "—" : isPct ? `${v >= 0 ? "" : ""}${v.toFixed(1)}%` : money(v);
+                          const color = v === null || v === undefined ? "#B0B4BC" : vendorMetric === "marginDiff" ? (v >= 0 ? "#5B7A5B" : "#B5432D") : "#20232B";
+                          return <td key={mStr} className="text-right py-1.5 px-2" style={{ color }}>{display}</td>;
+                        })}
+                        <td className="text-right py-1.5 px-2" style={{ fontWeight: 600 }}>{money(totalSales)}</td>
+                      </tr>
+                    ))}
                 </tbody>
               </table>
             </div>
