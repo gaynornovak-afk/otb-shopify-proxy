@@ -198,6 +198,7 @@ function OTBEngine() {
   const [vendorStatus, setVendorStatus] = useState("");
   const [loadingVendors, setLoadingVendors] = useState(false);
   const [vendorSort, setVendorSort] = useState("sales");
+  const [vendorMonthOffset, setVendorMonthOffset] = useState(0); // 0 = current month, negative = past, positive = future
   const [syncStatus, setSyncStatus] = useState("");
   const [syncing, setSyncing] = useState(false);
   const [importText, setImportText] = useState("");
@@ -558,9 +559,12 @@ function OTBEngine() {
   }
   async function loadVendorReport() {
     setLoadingVendors(true);
-    setVendorStatus(`Loading vendor performance for ${monthLabel(months[monthCursor])}…`);
+    const targetDate = new Date();
+    targetDate.setDate(1);
+    targetDate.setMonth(targetDate.getMonth() + vendorMonthOffset);
+    const mStr = `${targetDate.getFullYear()}-${String(targetDate.getMonth() + 1).padStart(2, "0")}`;
+    setVendorStatus(`Loading vendor performance for ${monthLabel(mStr)}…`);
     try {
-      const mStr = months[monthCursor];
       const [y, m] = mStr.split("-").map(Number);
       const lastDay = new Date(y, m, 0).getDate();
       const start = `${mStr}-01`;
@@ -920,10 +924,16 @@ function OTBEngine() {
       {showVendors && (
         <Modal onClose={() => setShowVendors(false)} title="Vendor performance">
           <p className="text-sm mb-3" style={{ color: "#5C6270" }}>
-            Actual margin comes from real synced sales & COGS by vendor. Planned margin is a sales-weighted average of the GM% assumptions for whatever categories that vendor's products fall into.
+            Actual margin comes from real synced sales & COGS by vendor. Planned margin is a sales-weighted average of the GM% assumptions for whatever categories that vendor's products fall into. Use the arrows below to look at any month, forward or back - though going back more than ~60 days may come back empty if your Shopify app doesn't have extended order history access yet.
           </p>
           <div className="flex items-center gap-2 mb-3 flex-wrap">
-            <span className="text-xs" style={{ color: "#5C6270" }}>Month: <b>{monthLabel(months[monthCursor])}</b> (use the dashboard arrows to change)</span>
+            <div className="flex items-center gap-2">
+              <button onClick={() => setVendorMonthOffset((o) => o - 1)} className="p-1 rounded" style={{ background: "#F1EEE6" }}><Icon.chevronLeft /></button>
+              <span className="text-xs" style={{ color: "#5C6270" }}>
+                Month: <b>{(() => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + vendorMonthOffset); return monthLabel(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`); })()}</b>
+              </span>
+              <button onClick={() => setVendorMonthOffset((o) => o + 1)} className="p-1 rounded" style={{ background: "#F1EEE6" }}><Icon.chevronRight /></button>
+            </div>
             <button onClick={loadVendorReport} disabled={loadingVendors} className="text-xs px-3 py-2 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
               <Icon.refresh /> {loadingVendors ? "Loading…" : "Load vendor performance"}
             </button>
