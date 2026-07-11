@@ -193,6 +193,11 @@ function OTBEngine() {
   const [suggestionsStatus, setSuggestionsStatus] = useState("");
   const [calculatingSuggestions, setCalculatingSuggestions] = useState(false);
   const [showSync, setShowSync] = useState(false);
+  const [showVendors, setShowVendors] = useState(false);
+  const [vendorReport, setVendorReport] = useState(null);
+  const [vendorStatus, setVendorStatus] = useState("");
+  const [loadingVendors, setLoadingVendors] = useState(false);
+  const [vendorSort, setVendorSort] = useState("sales");
   const [syncStatus, setSyncStatus] = useState("");
   const [syncing, setSyncing] = useState(false);
   const [importText, setImportText] = useState("");
@@ -551,6 +556,45 @@ function OTBEngine() {
     } catch (e) { setSyncStatus("Sync failed: " + e.message); }
     setSyncing(false);
   }
+  async function loadVendorReport() {
+    setLoadingVendors(true);
+    setVendorStatus(`Loading vendor performance for ${monthLabel(months[monthCursor])}…`);
+    try {
+      const mStr = months[monthCursor];
+      const [y, m] = mStr.split("-").map(Number);
+      const lastDay = new Date(y, m, 0).getDate();
+      const start = `${mStr}-01`;
+      const end = `${mStr}-${String(lastDay).padStart(2, "0")}`;
+      const res = await fetch(`/vendor-report?start=${start}&end=${end}`).then((r) => r.json());
+      if (res.error) throw new Error(res.error);
+
+      const typeToCat = Object.fromEntries(TAXONOMY);
+      const rows = Object.entries(res.vendors || {}).map(([vendor, v]) => {
+        const actualMarginPct = v.sales > 0 ? ((v.sales - v.cogs) / v.sales) * 100 : null;
+        // Planned margin: sales-weighted average of each category's GM% assumption,
+        // weighted by how much of this vendor's sales fell into each category.
+        let weightedGM = 0, weightTotal = 0;
+        Object.entries(v.byType).forEach(([type, t]) => {
+          const cat = typeToCat[type];
+          const gm = getAssumptions(cat).gmPct;
+          weightedGM += gm * t.sales;
+          weightTotal += t.sales;
+        });
+        const plannedMarginPct = weightTotal > 0 ? weightedGM / weightTotal : null;
+        return {
+          vendor, sales: v.sales, cogs: v.cogs,
+          actualMarginPct, plannedMarginPct,
+          marginDiff: actualMarginPct !== null && plannedMarginPct !== null ? actualMarginPct - plannedMarginPct : null,
+        };
+      });
+      setVendorReport(rows);
+      setVendorStatus(`Loaded ${rows.length} vendors for ${monthLabel(mStr)}.${res.truncated ? " (large order history - some may be missing)" : ""}`);
+    } catch (e) {
+      setVendorStatus("Failed to load: " + e.message);
+    }
+    setLoadingVendors(false);
+  }
+
   async function syncInventory() {
     setSyncing(true);
     setSyncStatus("Syncing current inventory…");
@@ -667,6 +711,9 @@ function OTBEngine() {
           <div className="flex gap-2">
             <button onClick={() => setShowSync(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
               <Icon.wifi /> Sync
+            </button>
+            <button onClick={() => setShowVendors(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
+              <Icon.sliders /> Vendors
             </button>
             <button onClick={() => setShowSettings(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
               <Icon.sliders /> Assumptions
@@ -866,6 +913,58 @@ function OTBEngine() {
           {syncStatus && <div className="text-xs" style={{ color: syncStatus.startsWith("Sync failed") || syncStatus.startsWith("Could not") ? "#B5432D" : "#5B7A5B" }}>{syncStatus}</div>}
           <div className="flex justify-end mt-4">
             <button onClick={() => setShowSync(false)} className="text-xs px-3 py-2 rounded" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 600 }}>Done</button>
+          </div>
+        </Modal>
+      )}
+
+      {showVendors && (
+        <Modal onClose={() => setShowVendors(false)} title="Vendor performance">
+          <p className="text-sm mb-3" style={{ color: "#5C6270" }}>
+            Actual margin comes from real synced sales & COGS by vendor. Planned margin is a sales-weighted average of the GM% assumptions for whatever categories that vendor's products fall into.
+          </p>
+          <div className="flex items-center gap-2 mb-3 flex-wrap">
+            <span className="text-xs" style={{ color: "#5C6270" }}>Month: <b>{monthLabel(months[monthCursor])}</b> (use the dashboard arrows to change)</span>
+            <button onClick={loadVendorReport} disabled={loadingVendors} className="text-xs px-3 py-2 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
+              <Icon.refresh /> {loadingVendors ? "Loading…" : "Load vendor performance"}
+            </button>
+          </div>
+          {vendorStatus && <div className="text-xs mb-3" style={{ color: vendorStatus.startsWith("Failed") ? "#B5432D" : "#5B7A5B" }}>{vendorStatus}</div>}
+          {vendorReport && (
+            <div className="overflow-x-auto max-h-96 overflow-y-auto border rounded" style={{ borderColor: "#DCD5C4" }}>
+              <table style={{ borderCollapse: "collapse", fontFamily: "'IBM Plex Mono', monospace" }} className="w-full text-xs">
+                <thead>
+                  <tr style={{ position: "sticky", top: 0, background: "#20232B", color: "#EDE7DA" }}>
+                    <th className="text-left py-2 px-2 cursor-pointer" onClick={() => setVendorSort("vendor")}>Vendor</th>
+                    <th className="text-right py-2 px-2 cursor-pointer" onClick={() => setVendorSort("sales")}>Sales $</th>
+                    <th className="text-right py-2 px-2 cursor-pointer" onClick={() => setVendorSort("cogs")}>COGS $</th>
+                    <th className="text-right py-2 px-2 cursor-pointer" onClick={() => setVendorSort("actualMarginPct")}>Actual Margin</th>
+                    <th className="text-right py-2 px-2 cursor-pointer" onClick={() => setVendorSort("plannedMarginPct")}>Planned Margin</th>
+                    <th className="text-right py-2 px-2 cursor-pointer" onClick={() => setVendorSort("marginDiff")}>Diff</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[...vendorReport].sort((a, b) => {
+                    if (vendorSort === "vendor") return a.vendor.localeCompare(b.vendor);
+                    const av = a[vendorSort] ?? -Infinity, bv = b[vendorSort] ?? -Infinity;
+                    return bv - av;
+                  }).map((row, i) => (
+                    <tr key={i} style={{ borderTop: "1px solid #EDE9DE" }}>
+                      <td className="py-1.5 px-2" style={{ fontWeight: 500 }}>{row.vendor}</td>
+                      <td className="text-right py-1.5 px-2">{money(row.sales)}</td>
+                      <td className="text-right py-1.5 px-2">{money(row.cogs)}</td>
+                      <td className="text-right py-1.5 px-2">{row.actualMarginPct !== null ? row.actualMarginPct.toFixed(1) + "%" : "—"}</td>
+                      <td className="text-right py-1.5 px-2" style={{ color: "#8B8F98" }}>{row.plannedMarginPct !== null ? row.plannedMarginPct.toFixed(1) + "%" : "—"}</td>
+                      <td className="text-right py-1.5 px-2" style={{ color: row.marginDiff === null ? "#20232B" : row.marginDiff >= 0 ? "#5B7A5B" : "#B5432D", fontWeight: 600 }}>
+                        {row.marginDiff !== null ? (row.marginDiff >= 0 ? "+" : "") + row.marginDiff.toFixed(1) + "%" : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <div className="flex justify-end mt-4">
+            <button onClick={() => setShowVendors(false)} className="text-xs px-3 py-2 rounded" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 600 }}>Done</button>
           </div>
         </Modal>
       )}

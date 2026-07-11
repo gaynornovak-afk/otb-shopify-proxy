@@ -224,6 +224,153 @@ app.get("/sales-by-type", async (req, res) => {
   }
 });
 
+// GET /vendor-report?start=2026-07-01&end=2026-07-31
+// Returns { vendors: { "VendorName": { sales, cogs, byType: { "1101 ...": {sales, cogs} } } } }
+// Same proven logic as /sales-by-type (gift card exclusion, order-subtotal reconciliation for
+// discounts like loyalty points, refunds attributed to the month they happened) but grouped by
+// vendor instead of category, with a per-product-type breakdown so the frontend can compute a
+// sales-weighted "planned margin" from each category's GM% assumption.
+app.get("/vendor-report", async (req, res) => {
+  const { start, end } = req.query;
+  if (!start || !end) return res.status(400).json({ error: "start and end (YYYY-MM-DD) are required" });
+
+  const vendorTotals = {};
+  function addVendor(vendor, type, sales, cogs) {
+    if (!vendor) vendor = "(No vendor set)";
+    if (!type) type = "9999 Unclassified";
+    if (!vendorTotals[vendor]) vendorTotals[vendor] = { sales: 0, cogs: 0, byType: {} };
+    vendorTotals[vendor].sales += sales;
+    vendorTotals[vendor].cogs += cogs;
+    if (!vendorTotals[vendor].byType[type]) vendorTotals[vendor].byType[type] = { sales: 0, cogs: 0 };
+    vendorTotals[vendor].byType[type].sales += sales;
+    vendorTotals[vendor].byType[type].cogs += cogs;
+  }
+  function inRange(isoDateTime) {
+    const d = (isoDateTime || "").slice(0, 10);
+    return d >= start && d <= end;
+  }
+
+  const MAX_PAGES = 40;
+  let truncated = false;
+
+  try {
+    // Pass 1: gross sales - orders CREATED in this window
+    {
+      const searchQuery = `created_at:>=${start} AND created_at:<=${end} AND -status:cancelled`;
+      let cursor = null, hasNextPage = true, pages = 0;
+      const query = `
+        query($cursor: String, $searchQuery: String!) {
+          orders(first: 50, after: $cursor, query: $searchQuery) {
+            edges {
+              cursor
+              node {
+                currentSubtotalPriceSet { shopMoney { amount } }
+                lineItems(first: 100) {
+                  edges {
+                    node {
+                      quantity
+                      isGiftCard
+                      vendor
+                      discountedTotalSet { shopMoney { amount } }
+                      product { productType }
+                      variant { inventoryItem { unitCost { amount } } }
+                    }
+                  }
+                }
+              }
+            }
+            pageInfo { hasNextPage }
+          }
+        }
+      `;
+      while (hasNextPage && pages < MAX_PAGES) {
+        const data = await shopifyGraphQL(query, { cursor, searchQuery });
+        data.orders.edges.forEach(({ node, cursor: c }) => {
+          cursor = c;
+          const orderLines = [];
+          let lineItemSum = 0;
+          node.lineItems.edges.forEach(({ node: li }) => {
+            if (li.isGiftCard) return;
+            const type = li.product?.productType;
+            const vendor = li.vendor;
+            const sales = parseFloat(li.discountedTotalSet.shopMoney.amount || 0);
+            const unitCost = parseFloat(li.variant?.inventoryItem?.unitCost?.amount || 0);
+            const cogs = unitCost * li.quantity;
+            lineItemSum += sales;
+            orderLines.push({ type, vendor, sales, cogs });
+          });
+          const orderSubtotal = parseFloat(node.currentSubtotalPriceSet?.shopMoney?.amount ?? lineItemSum);
+          const extraDiscount = lineItemSum - orderSubtotal;
+          orderLines.forEach((line) => {
+            let adjustedSales = line.sales;
+            if (extraDiscount > 0.01 && lineItemSum > 0) {
+              adjustedSales -= extraDiscount * (line.sales / lineItemSum);
+            }
+            addVendor(line.vendor, line.type, adjustedSales, line.cogs);
+          });
+        });
+        hasNextPage = data.orders.pageInfo.hasNextPage;
+        pages++;
+      }
+      if (hasNextPage) truncated = true;
+    }
+
+    // Pass 2: returns - orders UPDATED in this window, refunds attributed by their own date
+    {
+      const searchQuery = `updated_at:>=${start} AND updated_at:<=${end} AND -status:cancelled`;
+      let cursor = null, hasNextPage = true, pages = 0;
+      const query = `
+        query($cursor: String, $searchQuery: String!) {
+          orders(first: 50, after: $cursor, query: $searchQuery) {
+            edges {
+              cursor
+              node {
+                refunds {
+                  createdAt
+                  refundLineItems(first: 100) {
+                    edges {
+                      node {
+                        quantity
+                        subtotalSet { shopMoney { amount } }
+                        lineItem { isGiftCard vendor product { productType } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            pageInfo { hasNextPage }
+          }
+        }
+      `;
+      while (hasNextPage && pages < MAX_PAGES) {
+        const data = await shopifyGraphQL(query, { cursor, searchQuery });
+        data.orders.edges.forEach(({ node, cursor: c }) => {
+          cursor = c;
+          node.refunds.forEach((refund) => {
+            if (!inRange(refund.createdAt)) return;
+            refund.refundLineItems.edges.forEach(({ node: rli }) => {
+              if (rli.lineItem?.isGiftCard) return;
+              const type = rli.lineItem?.product?.productType;
+              const vendor = rli.lineItem?.vendor;
+              const refundAmt = parseFloat(rli.subtotalSet.shopMoney.amount || 0);
+              addVendor(vendor, type, -refundAmt, 0);
+            });
+          });
+        });
+        hasNextPage = data.orders.pageInfo.hasNextPage;
+        pages++;
+      }
+      if (hasNextPage) truncated = true;
+    }
+
+    res.json({ vendors: vendorTotals, truncated });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 // GET /inventory-by-type
 // Returns { "1101 Tees/Tunics Solid": { units: 120, value: 4560.00 }, ... }
 app.get("/inventory-by-type", async (req, res) => {
