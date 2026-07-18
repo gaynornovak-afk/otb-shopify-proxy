@@ -197,9 +197,7 @@ function OTBEngine() {
   const [showVendors, setShowVendors] = useState(false);
   const [showMonthPace, setShowMonthPace] = useState(false);
   const [expandedPaceCat, setExpandedPaceCat] = useState(null);
-  const [paceLYWindow, setPaceLYWindow] = useState(null); // { start, end, totals: {type: {sales, cogs}}, truncated }
-  const [paceLoading, setPaceLoading] = useState(false);
-  const [paceStatus, setPaceStatus] = useState("");
+  const [dailySales, setDailySales] = useState({}); // { "YYYY-MM-DD": netSalesAmount } - imported via CSV, since Shopify's live Admin API only reaches back ~60 days, too short to pull LY comparisons directly.
   const [vendorTable, setVendorTable] = useState(null); // { vendor: { mStr: {sales, cogs, actualMarginPct, plannedMarginPct, marginDiff} } }
   const [vendorMonths, setVendorMonths] = useState([]); // array of "YYYY-MM" strings, loaded range
   const [vendorStatus, setVendorStatus] = useState("");
@@ -229,6 +227,7 @@ function OTBEngine() {
           setAssumptions(parsed.assumptions || {});
           setStartingBOM(parsed.startingBOM || {});
           setData(parsed.data || {});
+          setDailySales(parsed.dailySales || {});
           loadedFromServer = true;
         }
       } catch (e) { /* server unreachable or not configured yet - fall through to local copy below */ }
@@ -242,6 +241,7 @@ function OTBEngine() {
             setAssumptions(parsed.assumptions || {});
             setStartingBOM(parsed.startingBOM || {});
             setData(parsed.data || {});
+            setDailySales(parsed.dailySales || {});
           }
         } catch (e2) { /* first run, nothing anywhere yet */ }
       }
@@ -253,7 +253,7 @@ function OTBEngine() {
     if (!loaded) return;
     setSaveState("saving");
     const t = setTimeout(async () => {
-      const payload = { assumptions, startingBOM, data };
+      const payload = { assumptions, startingBOM, data, dailySales };
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payload)); // always keep a local backup copy too
       } catch (e) { /* ignore quota errors */ }
@@ -263,15 +263,7 @@ function OTBEngine() {
       } catch (e) { setSaveState("saved locally only"); }
     }, 400);
     return () => clearTimeout(t);
-  }, [assumptions, startingBOM, data, loaded]);
-
-  // Auto-load the weekday-matched LY comparison the first time Month Pace is opened for a given
-  // month, so it's ready without an extra click - refresh button below covers re-pulling later.
-  useEffect(() => {
-    if (!showMonthPace || !loaded || !months[0]) return;
-    if (paceLYWindow && paceLYWindow.mStr === months[0]) return; // already have it for this month
-    loadPaceComparison();
-  }, [showMonthPace, loaded, months]);
+  }, [assumptions, startingBOM, data, dailySales, loaded]);
 
   function getAssumptions(cat) { return assumptions[cat] || defaultAssumptions(); }
   function setAssumption(cat, patch) { setAssumptions((prev) => ({ ...prev, [cat]: { ...getAssumptions(cat), ...patch } })); }
@@ -363,7 +355,8 @@ function OTBEngine() {
     const daysElapsed = isActualCurrentMonth ? today.getDate() : totalDays;
     const pctElapsed = daysElapsed / totalDays;
 
-    const usingWeekdayMatch = paceLYWindow && paceLYWindow.mStr === mStr;
+    const dailyPace = computeDailyPaceRatio(mStr, daysElapsed);
+    const usingWeekdayMatch = dailyPace.complete;
 
     const rows = {};
     TAXONOMY.forEach(([type, cat]) => {
@@ -376,15 +369,13 @@ function OTBEngine() {
       const forecastRetail = lySales * (1 + growth);
       const forecastCost = forecastRetail * (1 - gmAssumption / 100);
 
-      let expectedRetail, expectedCost;
-      if (usingWeekdayMatch) {
-        const wd = paceLYWindow.totals[type];
-        expectedRetail = (wd ? wd.sales : 0) * (1 + growth);
-        expectedCost = (wd ? wd.cogs : 0) * (1 + growth);
-      } else {
-        expectedRetail = forecastRetail * pctElapsed;
-        expectedCost = forecastCost * pctElapsed;
-      }
+      // Applies one store-wide weekday-matched pacing ratio (from imported daily sales) to each
+      // row's own forecast - a deliberate simplification, since we only have daily granularity
+      // store-wide, not per Product Type. Falls back to flat "% of days elapsed" if the daily
+      // import doesn't fully cover both the comparison window and the full LY month.
+      const ratio = usingWeekdayMatch ? dailyPace.ratio : pctElapsed;
+      const expectedRetail = forecastRetail * ratio;
+      const expectedCost = forecastCost * ratio;
 
       const hasActuals = row.actualSales !== "" && row.actualSales !== undefined;
       const actualRetail = hasActuals ? num(row.actualSales) : null;
@@ -440,8 +431,8 @@ function OTBEngine() {
     CATEGORIES.forEach((cat) => { catTotals[cat] = rollUp(TYPES_BY_CATEGORY[cat]); });
     const grand = rollUp(TAXONOMY.map(([t]) => t));
 
-    return { mStr, pctElapsed, daysElapsed, totalDays, rows, catTotals, grand, usingWeekdayMatch };
-  }, [data, assumptions, months, paceLYWindow]);
+    return { mStr, pctElapsed, daysElapsed, totalDays, rows, catTotals, grand, usingWeekdayMatch, dailyPace };
+  }, [data, assumptions, months, dailySales]);
 
   const filteredTaxonomy = filterSelection === "all" ? TAXONOMY
     : filterSelection.startsWith("cat:") ? TAXONOMY.filter(([, cat]) => cat === filterSelection.slice(4))
@@ -480,6 +471,12 @@ function OTBEngine() {
           setImportPreview(res.data.slice(0, 5000));
           return;
         }
+        const isDailySalesFormat = !cols.includes("Product Type") && cols.some((c) => /^(day|date)$/i.test(c.trim())) && cols.some((c) => /sales/i.test(c));
+        if (isDailySalesFormat) {
+          setImportFormat("dailySales");
+          setImportPreview(res.data.slice(0, 5000));
+          return;
+        }
         setImportFormat("generic");
         const required = ["Product Type", "Month"];
         const missing = required.filter((r) => !cols.includes(r));
@@ -511,6 +508,7 @@ function OTBEngine() {
     if (!importPreview) return;
     if (importFormat === "po") { applyPOImport(); return; }
     if (importFormat === "bom") { applyBOMImport(); return; }
+    if (importFormat === "dailySales") { applyDailySalesImport(); return; }
     const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
     setData((prev) => {
       const next = { ...prev };
@@ -596,6 +594,40 @@ function OTBEngine() {
     setImportSummary(`Set starting BOM for ${matched} product types.`);
     setShowImport(false); setImportText(""); setImportPreview(null);
   }
+  // Parses dates like "Jul 1, 2026", "2026-07-01", "07/01/2026" into an ISO "YYYY-MM-DD" string.
+  // Store-wide daily net sales, used to build a real (not flat-assumed) pacing curve for Month
+  // Pace's Expected-to-date - see computeDailyPaceRatio. Merges into dailySales rather than
+  // replacing it, so LY and multiple months can be imported separately over time.
+  function parseDailyDateToISO(raw) {
+    const s = (raw || "").trim();
+    if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(s)) {
+      const [y, m, d] = s.split("-");
+      return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+    }
+    const m1 = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); // "07/01/2026"
+    if (m1) return `${m1[3]}-${m1[1].padStart(2, "0")}-${m1[2].padStart(2, "0")}`;
+    const d = new Date(s); // handles "Jul 1, 2026", "July 1 2026", etc.
+    if (!isNaN(d.getTime())) return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    return null;
+  }
+  function applyDailySalesImport() {
+    const cols = Object.keys(importPreview[0] || {});
+    const dateCol = cols.find((c) => /^(day|date)$/i.test(c.trim()));
+    const salesCol = cols.find((c) => /sales/i.test(c));
+    if (!dateCol || !salesCol) { setImportError("Could not find a Day/Date column and a Sales column in this file."); return; }
+    let matched = 0, skipped = 0;
+    const updates = {};
+    importPreview.forEach((r) => {
+      const iso = parseDailyDateToISO(r[dateCol]);
+      const amt = Number(String(r[salesCol] ?? "").replace(/[^0-9.\-]/g, ""));
+      if (!iso || isNaN(amt)) { skipped++; return; }
+      updates[iso] = amt;
+      matched++;
+    });
+    setDailySales((prev) => ({ ...prev, ...updates }));
+    setImportSummary(`Imported daily sales for ${matched} day(s)${skipped ? `, skipped ${skipped} row(s) that didn't parse` : ""}.`);
+    setShowImport(false); setImportText(""); setImportPreview(null);
+  }
   function handleFileUpload(e) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -636,38 +668,48 @@ function OTBEngine() {
     } catch (e) { setSyncStatus("Could not reach the backend: " + e.message); }
   }
   // Weekday-matched LY comparison for Month Pace's Expected-to-date. Rather than assuming sales
-  // land evenly across the month (flat % of days elapsed), this pulls LY's actual sales for the
-  // same weekday-aligned window - e.g. "Jul 1-18, 2026" compares against "Jul 2-19, 2025" if that's
-  // the range with matching weekdays - same approach Shopify's own reports use, since a store's
-  // daily rhythm tracks day-of-week (weekend traffic, etc) far more than raw calendar date.
-  async function loadPaceComparison() {
-    if (!months[0]) return;
-    setPaceLoading(true);
-    setPaceStatus("Loading weekday-matched comparison…");
-    try {
-      const mStr = months[0];
-      const [y, m] = mStr.split("-").map(Number);
-      const today = new Date();
-      const isActualCurrentMonth = today.getFullYear() === y && today.getMonth() + 1 === m;
-      const totalDays = new Date(y, m, 0).getDate();
-      const daysElapsed = isActualCurrentMonth ? today.getDate() : totalDays;
-
-      const thisMonthStart = new Date(y, m - 1, 1);
-      const lyMonthStart = new Date(y - 1, m - 1, 1);
-      const shift = (thisMonthStart.getDay() - lyMonthStart.getDay() + 7) % 7;
-      const lyWindowStart = new Date(lyMonthStart); lyWindowStart.setDate(lyMonthStart.getDate() + shift);
-      const lyWindowEnd = new Date(lyWindowStart); lyWindowEnd.setDate(lyWindowStart.getDate() + daysElapsed - 1);
-      const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-      const start = ymd(lyWindowStart), end = ymd(lyWindowEnd);
-
-      const res = await fetch(`/sales-by-type?start=${start}&end=${end}`).then((r) => r.json());
-      if (res.error) throw new Error(res.error);
-      setPaceLYWindow({ start, end, totals: res.totals || {}, truncated: !!res.truncated, mStr });
-      setPaceStatus(`Loaded LY comparison for ${start} – ${end}${res.truncated ? " (large order history - some data may be missing)" : ""}.`);
-    } catch (e) {
-      setPaceStatus("Failed to load: " + e.message);
+  // land evenly across the month (flat % of days elapsed), this compares against LY's actual daily
+  // sales for the same weekday-aligned window - e.g. "Jul 1-18, 2026" compares against "Jul 2-19,
+  // 2025" if that's the range with matching weekdays - same approach Shopify's own reports use,
+  // since a store's daily rhythm tracks day-of-week far more than raw calendar date.
+  // NOTE: Shopify's live Admin API only returns order history for the last ~60 days for custom
+  // apps like this one, so a year-old window can't be pulled live - this is why dailySales is
+  // imported via CSV (see the "Daily Sales" import format) instead of fetched from /sales-by-type.
+  function ymdLocal(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; }
+  function weekdayMatchedLYWindow(mStr, daysElapsed) {
+    const [y, m] = mStr.split("-").map(Number);
+    const thisMonthStart = new Date(y, m - 1, 1);
+    const lyMonthStart = new Date(y - 1, m - 1, 1);
+    const lyMonthEnd = new Date(y - 1, m, 0);
+    const shift = (thisMonthStart.getDay() - lyMonthStart.getDay() + 7) % 7;
+    const lyWindowStart = new Date(lyMonthStart); lyWindowStart.setDate(lyMonthStart.getDate() + shift);
+    const lyWindowEnd = new Date(lyWindowStart); lyWindowEnd.setDate(lyWindowStart.getDate() + daysElapsed - 1);
+    return { lyMonthStart, lyMonthEnd, lyWindowStart, lyWindowEnd };
+  }
+  // Returns { ratio, complete, ... } - ratio = fraction of LY's full month that landed in the
+  // weekday-matched window so far. complete = true only if every day in both ranges has imported
+  // data, so a partial import doesn't silently produce a misleading ratio.
+  function computeDailyPaceRatio(mStr, daysElapsed) {
+    const { lyMonthStart, lyMonthEnd, lyWindowStart, lyWindowEnd } = weekdayMatchedLYWindow(mStr, daysElapsed);
+    let windowSum = 0, windowDaysFound = 0, windowDaysTotal = 0;
+    for (let d = new Date(lyWindowStart); d <= lyWindowEnd; d.setDate(d.getDate() + 1)) {
+      windowDaysTotal++;
+      const key = ymdLocal(d);
+      if (dailySales[key] !== undefined) { windowSum += dailySales[key]; windowDaysFound++; }
     }
-    setPaceLoading(false);
+    let monthSum = 0, monthDaysFound = 0, monthDaysTotal = 0;
+    for (let d = new Date(lyMonthStart); d <= lyMonthEnd; d.setDate(d.getDate() + 1)) {
+      monthDaysTotal++;
+      const key = ymdLocal(d);
+      if (dailySales[key] !== undefined) { monthSum += dailySales[key]; monthDaysFound++; }
+    }
+    const complete = windowDaysFound === windowDaysTotal && monthDaysFound === monthDaysTotal && monthSum > 0;
+    return {
+      ratio: complete ? windowSum / monthSum : null, complete,
+      windowStart: ymdLocal(lyWindowStart), windowEnd: ymdLocal(lyWindowEnd),
+      monthStart: ymdLocal(lyMonthStart), monthEnd: ymdLocal(lyMonthEnd),
+      windowDaysFound, windowDaysTotal, monthDaysFound, monthDaysTotal,
+    };
   }
 
   async function syncSales() {
@@ -939,14 +981,16 @@ function OTBEngine() {
         <p className="text-xs mb-2" style={{ color: "#5C6270" }}>
           Read-only pace check, separate from the Over/Under buy logic above. Answers "are we selling ahead of plan enough that reordering now would capture sales we'd otherwise miss" — not a stockout warning.
           {monthPace.usingWeekdayMatch
-            ? ` Expected-to-date compares against LY's actual sales for the weekday-matched window ${paceLYWindow.start} – ${paceLYWindow.end} (not raw calendar dates), trended by your growth assumption - this respects both the shape of the month and day-of-week traffic patterns, the same approach Shopify's own reports use.`
-            : " Expected-to-date is currently a flat estimate (LY month total ÷ days, prorated) - click Refresh below to load the more accurate weekday-matched comparison."}
+            ? ` Expected-to-date uses imported daily sales for the weekday-matched window ${monthPace.dailyPace.windowStart} – ${monthPace.dailyPace.windowEnd} (not raw calendar dates) as a store-wide pacing ratio applied to each row's own forecast - respects both the shape of the month and day-of-week traffic, the same approach Shopify's own reports use.`
+            : ` Expected-to-date is currently a flat estimate (forecast ÷ days, prorated evenly) - Shopify's live API only reaches back ~60 days, too short for a year-ago comparison, so the more accurate weekday-matched version needs daily sales imported via CSV for LY's full ${monthLabel(`${monthPace.dailyPace.monthStart.slice(0,7)}`)} (has ${monthPace.dailyPace.monthDaysFound} of ${monthPace.dailyPace.monthDaysTotal} days so far).`}
         </p>
         <div className="flex items-center gap-3 mb-3">
-          <button onClick={loadPaceComparison} disabled={paceLoading} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
-            <Icon.refresh /> {paceLoading ? "Loading…" : "Refresh comparison"}
+          <button onClick={() => { setShowImport(true); setImportFormat("dailySales"); }} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5" style={{ background: "#20232B", color: "#F1EEE6" }}>
+            <Icon.upload /> Import daily sales
           </button>
-          {paceStatus && <span className="text-xs" style={{ color: paceStatus.startsWith("Failed") ? "#B5432D" : "#5B7A5B" }}>{paceStatus}</span>}
+          {!monthPace.usingWeekdayMatch && (monthPace.dailyPace.windowDaysFound > 0 || monthPace.dailyPace.monthDaysFound > 0) && (
+            <span className="text-xs" style={{ color: "#8C6E4A" }}>Partial data loaded: {monthPace.dailyPace.monthDaysFound}/{monthPace.dailyPace.monthDaysTotal} days of LY month, {monthPace.dailyPace.windowDaysFound}/{monthPace.dailyPace.windowDaysTotal} of the comparison window.</span>
+          )}
         </div>
         <div style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }} className="rounded-md overflow-hidden">
           <div style={{ maxHeight: "70vh", overflow: "auto", position: "relative" }}>
@@ -1303,7 +1347,7 @@ function OTBEngine() {
 
       {showImport && (
         <Modal onClose={() => { setShowImport(false); setImportPreview(null); setImportError(""); }} title="Import from CSV">
-          <p className="text-sm mb-2" style={{ color: "#5C6270" }}>Two formats are auto-detected from the column headers:</p>
+          <p className="text-sm mb-2" style={{ color: "#5C6270" }}>Formats are auto-detected from the column headers:</p>
           <div className="text-xs mb-2 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
             <b>Actuals/plan:</b> Product Type, Month, LY Sales, LY COGS, Actual Sales, Actual COGS, Received, Balance to Receive
           </div>
@@ -1312,6 +1356,9 @@ function OTBEngine() {
           </div>
           <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
             <b>Starting BOM template:</b> Planning Category, Shopify Product Type, Plan Month, Beginning Inv $ — sets each product type's Starting Actual BOM $.
+          </div>
+          <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
+            <b>Daily sales (by date):</b> a Day/Date column plus a Net Sales column, store-wide (not per Product Type) — e.g. Shopify's own "Sales over time" report exported to CSV. Powers Month Pace's weekday-matched Expected-to-date, since Shopify's live API can't reach back a year on its own. Import LY's full month at minimum; safe to re-import/add more dates any time, existing dates just get overwritten.
           </div>
           {importSummary && <div className="text-xs mb-3 p-2 rounded" style={{ background: "#EDF3EA", color: "#5B7A5B" }}>{importSummary}</div>}
           <div className="flex gap-2 mb-3">
@@ -1324,13 +1371,15 @@ function OTBEngine() {
           {importError && <div className="text-xs mt-2" style={{ color: "#B5432D" }}>{importError}</div>}
           {importPreview && (
             <div className="mt-3 text-xs max-h-40 overflow-y-auto border rounded p-2" style={{ borderColor: "#DCD5C4" }}>
-              <div className="mb-1" style={{ color: "#8C6E4A", fontWeight: 600 }}>Detected format: {importFormat === "po" ? "PO/receiving export" : importFormat === "bom" ? "Starting BOM template" : "Actuals/plan"} ({importPreview.length} rows)</div>
+              <div className="mb-1" style={{ color: "#8C6E4A", fontWeight: 600 }}>Detected format: {importFormat === "po" ? "PO/receiving export" : importFormat === "bom" ? "Starting BOM template" : importFormat === "dailySales" ? "Daily sales (by date)" : "Actuals/plan"} ({importPreview.length} rows)</div>
               {importPreview.slice(0, 8).map((r, i) => (
                 <div key={i} style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
                   {importFormat === "po"
                     ? `${r["Product Type"]} · ordered ${r["Total Cost Ordered"]} · received ${r["Total Cost Received"]}`
                     : importFormat === "bom"
                     ? `${r[Object.keys(r).find((c) => c.toLowerCase().includes("shopify product type"))]} · ${r[Object.keys(r).find((c) => c.toLowerCase().includes("beginning inv"))]}`
+                    : importFormat === "dailySales"
+                    ? `${r[Object.keys(r).find((c) => /^(day|date)$/i.test(c.trim()))]} · ${r[Object.keys(r).find((c) => /sales/i.test(c))]}`
                     : `${r["Product Type"]} · ${r["Month"]} · LY Sales ${r["LY Sales"] ?? "—"} · LY COGS ${r["LY COGS"] ?? "—"}`}
                 </div>
               ))}
