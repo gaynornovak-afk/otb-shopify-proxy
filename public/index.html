@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -194,6 +195,8 @@ function OTBEngine() {
   const [calculatingSuggestions, setCalculatingSuggestions] = useState(false);
   const [showSync, setShowSync] = useState(false);
   const [showVendors, setShowVendors] = useState(false);
+  const [showMonthPace, setShowMonthPace] = useState(false);
+  const [expandedPaceCat, setExpandedPaceCat] = useState(null);
   const [vendorTable, setVendorTable] = useState(null); // { vendor: { mStr: {sales, cogs, actualMarginPct, plannedMarginPct, marginDiff} } }
   const [vendorMonths, setVendorMonths] = useState([]); // array of "YYYY-MM" strings, loaded range
   const [vendorStatus, setVendorStatus] = useState("");
@@ -335,6 +338,89 @@ function OTBEngine() {
     TAXONOMY.forEach(([type, cat]) => { m[type] = computeSeries(type, cat); });
     return m;
   }, [data, assumptions, startingBOM, months]);
+
+  // Month Pace: for the current real-world month (months[0]), compares actual sales/COGS-to-date
+  // against where we'd expect to be given the forecast and how far through the calendar month we are.
+  // Answers "is this overperforming plan enough that I should reorder now, before I miss the sale."
+  const monthPace = useMemo(() => {
+    const mStr = months[0];
+    if (!mStr) return null;
+    const [y, m] = mStr.split("-").map(Number);
+    const totalDays = new Date(y, m, 0).getDate();
+    const today = new Date();
+    const isActualCurrentMonth = today.getFullYear() === y && today.getMonth() + 1 === m;
+    const daysElapsed = isActualCurrentMonth ? today.getDate() : totalDays;
+    const pctElapsed = daysElapsed / totalDays;
+
+    const rows = {};
+    TAXONOMY.forEach(([type, cat]) => {
+      const a = getAssumptions(cat);
+      const growth = a.growthPct / 100;
+      const gmAssumption = a.gmPct; // already a %, e.g. 55
+      const row = getRow(type, mStr);
+
+      const lySales = num(row.lySales), lyCogs = num(row.lyCogs);
+      const forecastRetail = lySales * (1 + growth);
+      const forecastCost = forecastRetail * (1 - gmAssumption / 100);
+      const expectedRetail = forecastRetail * pctElapsed;
+      const expectedCost = forecastCost * pctElapsed;
+
+      const hasActuals = row.actualSales !== "" && row.actualSales !== undefined;
+      const actualRetail = hasActuals ? num(row.actualSales) : null;
+      const actualCost = hasActuals ? num(row.actualCogs) : null;
+
+      const diffRetail = actualRetail === null ? null : actualRetail - expectedRetail;
+      const diffCost = actualCost === null ? null : actualCost - expectedCost;
+
+      const plannedMarginGM = gmAssumption; // %
+      const plannedMarginLY = lySales > 0 ? ((lySales - lyCogs) / lySales) * 100 : null;
+      const actualMarginPct = (actualRetail !== null && actualRetail > 0 && actualCost !== null)
+        ? ((actualRetail - actualCost) / actualRetail) * 100 : null;
+      const diffVsGM = actualMarginPct === null ? null : actualMarginPct - plannedMarginGM;
+      const diffVsLY = (actualMarginPct === null || plannedMarginLY === null) ? null : actualMarginPct - plannedMarginLY;
+
+      rows[type] = {
+        cat, forecastRetail, forecastCost, expectedRetail, expectedCost,
+        actualRetail, actualCost, diffRetail, diffCost,
+        plannedMarginGM, plannedMarginLY, actualMarginPct, diffVsGM, diffVsLY,
+      };
+    });
+
+    // Roll up dollars by summing (correct for $), then recompute margin % from the summed
+    // dollars rather than averaging percentages (avoids skew from small-dollar rows).
+    function rollUp(types) {
+      let forecastRetail = 0, forecastCost = 0, expectedRetail = 0, expectedCost = 0;
+      let actualRetail = 0, actualCost = 0, anyActuals = false;
+      let lySalesSum = 0, lyCogsSum = 0, weightedGM = 0, gmWeight = 0;
+      types.forEach((t) => {
+        const r = rows[t];
+        forecastRetail += r.forecastRetail; forecastCost += r.forecastCost;
+        expectedRetail += r.expectedRetail; expectedCost += r.expectedCost;
+        if (r.actualRetail !== null) { actualRetail += r.actualRetail; actualCost += r.actualCost; anyActuals = true; }
+        const row = getRow(t, mStr);
+        lySalesSum += num(row.lySales); lyCogsSum += num(row.lyCogs);
+        weightedGM += r.plannedMarginGM * r.forecastRetail; gmWeight += r.forecastRetail;
+      });
+      const plannedMarginGM = gmWeight > 0 ? weightedGM / gmWeight : null;
+      const plannedMarginLY = lySalesSum > 0 ? ((lySalesSum - lyCogsSum) / lySalesSum) * 100 : null;
+      const actualMarginPct = anyActuals && actualRetail > 0 ? ((actualRetail - actualCost) / actualRetail) * 100 : null;
+      return {
+        forecastRetail, forecastCost, expectedRetail, expectedCost,
+        actualRetail: anyActuals ? actualRetail : null, actualCost: anyActuals ? actualCost : null,
+        diffRetail: anyActuals ? actualRetail - expectedRetail : null,
+        diffCost: anyActuals ? actualCost - expectedCost : null,
+        plannedMarginGM, plannedMarginLY, actualMarginPct,
+        diffVsGM: actualMarginPct !== null && plannedMarginGM !== null ? actualMarginPct - plannedMarginGM : null,
+        diffVsLY: actualMarginPct !== null && plannedMarginLY !== null ? actualMarginPct - plannedMarginLY : null,
+      };
+    }
+
+    const catTotals = {};
+    CATEGORIES.forEach((cat) => { catTotals[cat] = rollUp(TYPES_BY_CATEGORY[cat]); });
+    const grand = rollUp(TAXONOMY.map(([t]) => t));
+
+    return { mStr, pctElapsed, daysElapsed, totalDays, rows, catTotals, grand };
+  }, [data, assumptions, months]);
 
   const filteredTaxonomy = filterSelection === "all" ? TAXONOMY
     : filterSelection.startsWith("cat:") ? TAXONOMY.filter(([, cat]) => cat === filterSelection.slice(4))
@@ -733,6 +819,9 @@ function OTBEngine() {
             <button onClick={() => setShowVendors(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
               <Icon.sliders /> Vendors
             </button>
+            <button onClick={() => setShowMonthPace(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
+              <Icon.refresh /> Month Pace
+            </button>
             <button onClick={() => setShowSettings(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
               <Icon.sliders /> Assumptions
             </button>
@@ -1017,6 +1106,83 @@ function OTBEngine() {
         </Modal>
       )}
 
+      {showMonthPace && monthPace && (
+        <Modal onClose={() => setShowMonthPace(false)} title={`Month Pace — ${monthLabel(monthPace.mStr)}`}>
+          <p className="text-sm mb-3" style={{ color: "#5C6270" }}>
+            This is a read-only pace check, separate from the Over/Under buy logic. It answers "are we selling ahead of plan enough that reordering now would capture sales we'd otherwise miss" — not a stockout warning. {monthPace.daysElapsed} of {monthPace.totalDays} days elapsed ({(monthPace.pctElapsed * 100).toFixed(1)}% of the month, calendar days).
+          </p>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+            <PaceSummaryCard label="Expected-to-date (Retail)" value={money(monthPace.grand.expectedRetail)} />
+            <PaceSummaryCard label="Actual-to-date (Retail)" value={money(monthPace.grand.actualRetail)} />
+            <PaceSummaryCard label="Diff (Retail)" value={money(monthPace.grand.diffRetail)} color={diffColor(monthPace.grand.diffRetail)} />
+            <PaceSummaryCard label="Actual Margin % to date" value={pctStr(monthPace.grand.actualMarginPct)} color={diffColor(monthPace.grand.diffVsGM)} />
+          </div>
+          <div className="overflow-auto border rounded" style={{ borderColor: "#DCD5C4", maxHeight: "65vh" }}>
+            <table style={{ borderCollapse: "collapse", fontFamily: "'IBM Plex Mono', monospace", width: "max-content", minWidth: "100%" }} className="text-xs">
+              <thead>
+                <tr>
+                  <th rowSpan={2} style={{ position: "sticky", top: 0, left: 0, zIndex: 4, background: "#20232B", color: "#EDE7DA", minWidth: CATW }} className="text-left py-2 px-2 align-bottom">Category</th>
+                  <th rowSpan={2} style={{ position: "sticky", top: 0, left: CATW, zIndex: 4, background: "#20232B", color: "#EDE7DA", minWidth: TYPEW }} className="text-left py-2 px-2 align-bottom">Product Type</th>
+                  <th colSpan={4} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA" }} className="text-center py-1.5 px-2 border-l" >Retail</th>
+                  <th colSpan={4} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA" }} className="text-center py-1.5 px-2 border-l">Cost</th>
+                  <th colSpan={5} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA" }} className="text-center py-1.5 px-2 border-l">Margin %</th>
+                </tr>
+                <tr>
+                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2 border-l">Forecast</th>
+                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2">Expected</th>
+                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2">Actual</th>
+                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2">Diff</th>
+                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2 border-l">Forecast</th>
+                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2">Expected</th>
+                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2">Actual</th>
+                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2">Diff</th>
+                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 78 }} className="text-right py-1.5 px-2 border-l">Plan (GM%)</th>
+                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 78 }} className="text-right py-1.5 px-2">Plan (LY)</th>
+                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 78 }} className="text-right py-1.5 px-2">Actual</th>
+                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 78 }} className="text-right py-1.5 px-2">vs GM%</th>
+                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 78 }} className="text-right py-1.5 px-2">vs LY</th>
+                </tr>
+              </thead>
+              <tbody>
+                {CATEGORIES.map((cat) => {
+                  const ct = monthPace.catTotals[cat];
+                  const isOpen = expandedPaceCat === cat;
+                  return (
+                    <Fragment key={cat}>
+                      <tr className="cursor-pointer" onClick={() => setExpandedPaceCat(isOpen ? null : cat)} style={{ borderTop: "1px solid #EDE9DE", background: "#F1EEE6" }}>
+                        <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#F1EEE6" }} className="py-2 px-2">
+                          <span className="flex items-center gap-1.5">
+                            <span style={{ width: 8, height: 8, borderRadius: 2, background: CATEGORY_COLOR[cat], flexShrink: 0 }} />
+                            {isOpen ? <Icon.chevronUp size={11} /> : <Icon.chevronDown size={11} />}
+                          </span>
+                        </td>
+                        <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#F1EEE6", fontWeight: 700 }} className="py-2 px-2">{cat}</td>
+                        <PaceCells row={ct} />
+                      </tr>
+                      {isOpen && TYPES_BY_CATEGORY[cat].map((type) => (
+                        <tr key={type} style={{ borderTop: "1px solid #EDE9DE" }}>
+                          <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#FFFFFF" }} className="py-1.5 px-2"></td>
+                          <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#FFFFFF" }} className="py-1.5 px-2">{type}</td>
+                          <PaceCells row={monthPace.rows[type]} />
+                        </tr>
+                      ))}
+                    </Fragment>
+                  );
+                })}
+                <tr style={{ borderTop: "2px solid #20232B", background: "#F1EEE6" }}>
+                  <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#F1EEE6" }} className="py-2 px-2"></td>
+                  <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#F1EEE6", fontWeight: 700 }} className="py-2 px-2">STORE TOTAL</td>
+                  <PaceCells row={monthPace.grand} bold />
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div className="flex justify-end mt-4">
+            <button onClick={() => setShowMonthPace(false)} className="text-xs px-3 py-2 rounded" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 600 }}>Done</button>
+          </div>
+        </Modal>
+      )}
+
       {showSettings && (
         <Modal onClose={() => setShowSettings(false)} title="Category assumptions">
           <div className="p-3 rounded mb-3" style={{ background: "#F1EEE6" }}>
@@ -1149,6 +1315,40 @@ function TypeDetail({ type, months, series, scrollStart, setScrollStart, visible
         </table>
       </div>
     </div>
+  );
+}
+
+function diffColor(v) { return v === null || v === undefined ? "#B0B4BC" : v >= 0 ? "#5B7A5B" : "#B5432D"; }
+function pctStr(v) { return v === null || v === undefined ? "—" : `${v.toFixed(1)}%`; }
+
+function PaceSummaryCard({ label, value, color }) {
+  return (
+    <div className="p-3 rounded" style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }}>
+      <div className="text-[10px] uppercase tracking-wider mb-1" style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }}>{label}</div>
+      <div className="text-base font-bold" style={{ color: color || "#20232B", fontFamily: "'Roboto Slab', serif" }}>{value}</div>
+    </div>
+  );
+}
+
+// Renders the 13 metric cells (Retail x4, Cost x4, Margin x5) for one Month Pace row.
+function PaceCells({ row, bold }) {
+  const fw = bold ? 700 : 400;
+  return (
+    <Fragment>
+      <td className="text-right py-1.5 px-2 border-l" style={{ fontWeight: fw }}>{money(row.forecastRetail)}</td>
+      <td className="text-right py-1.5 px-2" style={{ fontWeight: fw }}>{money(row.expectedRetail)}</td>
+      <td className="text-right py-1.5 px-2" style={{ fontWeight: fw }}>{row.actualRetail === null ? "—" : money(row.actualRetail)}</td>
+      <td className="text-right py-1.5 px-2" style={{ fontWeight: fw, color: diffColor(row.diffRetail) }}>{row.diffRetail === null ? "—" : money(row.diffRetail)}</td>
+      <td className="text-right py-1.5 px-2 border-l" style={{ fontWeight: fw }}>{money(row.forecastCost)}</td>
+      <td className="text-right py-1.5 px-2" style={{ fontWeight: fw }}>{money(row.expectedCost)}</td>
+      <td className="text-right py-1.5 px-2" style={{ fontWeight: fw }}>{row.actualCost === null ? "—" : money(row.actualCost)}</td>
+      <td className="text-right py-1.5 px-2" style={{ fontWeight: fw, color: diffColor(row.diffCost) }}>{row.diffCost === null ? "—" : money(row.diffCost)}</td>
+      <td className="text-right py-1.5 px-2 border-l" style={{ fontWeight: fw }}>{pctStr(row.plannedMarginGM)}</td>
+      <td className="text-right py-1.5 px-2" style={{ fontWeight: fw }}>{pctStr(row.plannedMarginLY)}</td>
+      <td className="text-right py-1.5 px-2" style={{ fontWeight: fw }}>{pctStr(row.actualMarginPct)}</td>
+      <td className="text-right py-1.5 px-2" style={{ fontWeight: fw, color: diffColor(row.diffVsGM) }}>{row.diffVsGM === null ? "—" : `${row.diffVsGM >= 0 ? "+" : ""}${row.diffVsGM.toFixed(1)}pt`}</td>
+      <td className="text-right py-1.5 px-2" style={{ fontWeight: fw, color: diffColor(row.diffVsLY) }}>{row.diffVsLY === null ? "—" : `${row.diffVsLY >= 0 ? "+" : ""}${row.diffVsLY.toFixed(1)}pt`}</td>
+    </Fragment>
   );
 }
 
