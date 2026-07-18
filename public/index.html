@@ -197,6 +197,9 @@ function OTBEngine() {
   const [showVendors, setShowVendors] = useState(false);
   const [showMonthPace, setShowMonthPace] = useState(false);
   const [expandedPaceCat, setExpandedPaceCat] = useState(null);
+  const [paceLYWindow, setPaceLYWindow] = useState(null); // { start, end, totals: {type: {sales, cogs}}, truncated }
+  const [paceLoading, setPaceLoading] = useState(false);
+  const [paceStatus, setPaceStatus] = useState("");
   const [vendorTable, setVendorTable] = useState(null); // { vendor: { mStr: {sales, cogs, actualMarginPct, plannedMarginPct, marginDiff} } }
   const [vendorMonths, setVendorMonths] = useState([]); // array of "YYYY-MM" strings, loaded range
   const [vendorStatus, setVendorStatus] = useState("");
@@ -261,6 +264,14 @@ function OTBEngine() {
     }, 400);
     return () => clearTimeout(t);
   }, [assumptions, startingBOM, data, loaded]);
+
+  // Auto-load the weekday-matched LY comparison the first time Month Pace is opened for a given
+  // month, so it's ready without an extra click - refresh button below covers re-pulling later.
+  useEffect(() => {
+    if (!showMonthPace || !loaded || !months[0]) return;
+    if (paceLYWindow && paceLYWindow.mStr === months[0]) return; // already have it for this month
+    loadPaceComparison();
+  }, [showMonthPace, loaded, months]);
 
   function getAssumptions(cat) { return assumptions[cat] || defaultAssumptions(); }
   function setAssumption(cat, patch) { setAssumptions((prev) => ({ ...prev, [cat]: { ...getAssumptions(cat), ...patch } })); }
@@ -352,6 +363,8 @@ function OTBEngine() {
     const daysElapsed = isActualCurrentMonth ? today.getDate() : totalDays;
     const pctElapsed = daysElapsed / totalDays;
 
+    const usingWeekdayMatch = paceLYWindow && paceLYWindow.mStr === mStr;
+
     const rows = {};
     TAXONOMY.forEach(([type, cat]) => {
       const a = getAssumptions(cat);
@@ -362,8 +375,16 @@ function OTBEngine() {
       const lySales = num(row.lySales), lyCogs = num(row.lyCogs);
       const forecastRetail = lySales * (1 + growth);
       const forecastCost = forecastRetail * (1 - gmAssumption / 100);
-      const expectedRetail = forecastRetail * pctElapsed;
-      const expectedCost = forecastCost * pctElapsed;
+
+      let expectedRetail, expectedCost;
+      if (usingWeekdayMatch) {
+        const wd = paceLYWindow.totals[type];
+        expectedRetail = (wd ? wd.sales : 0) * (1 + growth);
+        expectedCost = (wd ? wd.cogs : 0) * (1 + growth);
+      } else {
+        expectedRetail = forecastRetail * pctElapsed;
+        expectedCost = forecastCost * pctElapsed;
+      }
 
       const hasActuals = row.actualSales !== "" && row.actualSales !== undefined;
       const actualRetail = hasActuals ? num(row.actualSales) : null;
@@ -419,8 +440,8 @@ function OTBEngine() {
     CATEGORIES.forEach((cat) => { catTotals[cat] = rollUp(TYPES_BY_CATEGORY[cat]); });
     const grand = rollUp(TAXONOMY.map(([t]) => t));
 
-    return { mStr, pctElapsed, daysElapsed, totalDays, rows, catTotals, grand };
-  }, [data, assumptions, months]);
+    return { mStr, pctElapsed, daysElapsed, totalDays, rows, catTotals, grand, usingWeekdayMatch };
+  }, [data, assumptions, months, paceLYWindow]);
 
   const filteredTaxonomy = filterSelection === "all" ? TAXONOMY
     : filterSelection.startsWith("cat:") ? TAXONOMY.filter(([, cat]) => cat === filterSelection.slice(4))
@@ -614,6 +635,41 @@ function OTBEngine() {
       setSyncStatus(res.ok ? `Connected to ${res.store}` : "Reached the server but got an unexpected response.");
     } catch (e) { setSyncStatus("Could not reach the backend: " + e.message); }
   }
+  // Weekday-matched LY comparison for Month Pace's Expected-to-date. Rather than assuming sales
+  // land evenly across the month (flat % of days elapsed), this pulls LY's actual sales for the
+  // same weekday-aligned window - e.g. "Jul 1-18, 2026" compares against "Jul 2-19, 2025" if that's
+  // the range with matching weekdays - same approach Shopify's own reports use, since a store's
+  // daily rhythm tracks day-of-week (weekend traffic, etc) far more than raw calendar date.
+  async function loadPaceComparison() {
+    if (!months[0]) return;
+    setPaceLoading(true);
+    setPaceStatus("Loading weekday-matched comparison…");
+    try {
+      const mStr = months[0];
+      const [y, m] = mStr.split("-").map(Number);
+      const today = new Date();
+      const isActualCurrentMonth = today.getFullYear() === y && today.getMonth() + 1 === m;
+      const totalDays = new Date(y, m, 0).getDate();
+      const daysElapsed = isActualCurrentMonth ? today.getDate() : totalDays;
+
+      const thisMonthStart = new Date(y, m - 1, 1);
+      const lyMonthStart = new Date(y - 1, m - 1, 1);
+      const shift = (thisMonthStart.getDay() - lyMonthStart.getDay() + 7) % 7;
+      const lyWindowStart = new Date(lyMonthStart); lyWindowStart.setDate(lyMonthStart.getDate() + shift);
+      const lyWindowEnd = new Date(lyWindowStart); lyWindowEnd.setDate(lyWindowStart.getDate() + daysElapsed - 1);
+      const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      const start = ymd(lyWindowStart), end = ymd(lyWindowEnd);
+
+      const res = await fetch(`/sales-by-type?start=${start}&end=${end}`).then((r) => r.json());
+      if (res.error) throw new Error(res.error);
+      setPaceLYWindow({ start, end, totals: res.totals || {}, truncated: !!res.truncated, mStr });
+      setPaceStatus(`Loaded LY comparison for ${start} – ${end}${res.truncated ? " (large order history - some data may be missing)" : ""}.`);
+    } catch (e) {
+      setPaceStatus("Failed to load: " + e.message);
+    }
+    setPaceLoading(false);
+  }
+
   async function syncSales() {
     setSyncing(true);
     setSyncStatus(`Syncing sales & COGS for ${monthLabel(months[monthCursor])}…`);
@@ -880,9 +936,18 @@ function OTBEngine() {
 
       {showMonthPace && monthPace ? (
       <div className="px-4 sm:px-8 py-4">
-        <p className="text-xs mb-3" style={{ color: "#5C6270" }}>
+        <p className="text-xs mb-2" style={{ color: "#5C6270" }}>
           Read-only pace check, separate from the Over/Under buy logic above. Answers "are we selling ahead of plan enough that reordering now would capture sales we'd otherwise miss" — not a stockout warning.
+          {monthPace.usingWeekdayMatch
+            ? ` Expected-to-date compares against LY's actual sales for the weekday-matched window ${paceLYWindow.start} – ${paceLYWindow.end} (not raw calendar dates), trended by your growth assumption - this respects both the shape of the month and day-of-week traffic patterns, the same approach Shopify's own reports use.`
+            : " Expected-to-date is currently a flat estimate (LY month total ÷ days, prorated) - click Refresh below to load the more accurate weekday-matched comparison."}
         </p>
+        <div className="flex items-center gap-3 mb-3">
+          <button onClick={loadPaceComparison} disabled={paceLoading} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
+            <Icon.refresh /> {paceLoading ? "Loading…" : "Refresh comparison"}
+          </button>
+          {paceStatus && <span className="text-xs" style={{ color: paceStatus.startsWith("Failed") ? "#B5432D" : "#5B7A5B" }}>{paceStatus}</span>}
+        </div>
         <div style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }} className="rounded-md overflow-hidden">
           <div style={{ maxHeight: "70vh", overflow: "auto", position: "relative" }}>
             <table style={{ borderCollapse: "collapse", fontFamily: "'IBM Plex Mono', monospace", width: "max-content", minWidth: "100%" }} className="text-xs sm:text-sm">
