@@ -819,7 +819,7 @@ function OTBEngine() {
             <button onClick={() => setShowVendors(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
               <Icon.sliders /> Vendors
             </button>
-            <button onClick={() => setShowMonthPace(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
+            <button onClick={() => setShowMonthPace((v) => !v)} style={{ background: showMonthPace ? "#C99A3C" : "#2A303B", color: showMonthPace ? "#20232B" : "#EDE7DA", border: "1px solid #3A4150", fontWeight: showMonthPace ? 700 : 400 }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
               <Icon.refresh /> Month Pace
             </button>
             <button onClick={() => setShowSettings(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
@@ -836,6 +836,30 @@ function OTBEngine() {
       </div>
 
       <div className="px-4 sm:px-8 py-4" style={{ background: "#20232B" }}>
+        {showMonthPace && monthPace ? (
+          <div className="flex flex-wrap items-center gap-8">
+            <div>
+              <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">{monthLabel(monthPace.mStr)} — days elapsed</div>
+              <div style={{ fontFamily: "'Roboto Slab', serif", color: "#EDE7DA" }} className="text-2xl font-bold">{monthPace.daysElapsed} / {monthPace.totalDays} <span className="text-sm font-normal" style={{ color: "#9AA0AC" }}>({(monthPace.pctElapsed * 100).toFixed(1)}%)</span></div>
+            </div>
+            <div>
+              <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">Expected-to-date (Retail)</div>
+              <div style={{ fontFamily: "'Roboto Slab', serif", color: "#EDE7DA" }} className="text-2xl font-bold">{money(monthPace.grand.expectedRetail)}</div>
+            </div>
+            <div>
+              <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">Actual-to-date (Retail)</div>
+              <div style={{ fontFamily: "'Roboto Slab', serif", color: "#EDE7DA" }} className="text-2xl font-bold">{money(monthPace.grand.actualRetail)}</div>
+            </div>
+            <div>
+              <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">Diff (Retail)</div>
+              <div style={{ fontFamily: "'Roboto Slab', serif", color: diffColor(monthPace.grand.diffRetail) }} className="text-2xl font-bold">{money(monthPace.grand.diffRetail)}</div>
+            </div>
+            <div>
+              <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">Actual Margin % to date</div>
+              <div style={{ fontFamily: "'Roboto Slab', serif", color: diffColor(monthPace.grand.diffVsGM) }} className="text-2xl font-bold">{pctStr(monthPace.grand.actualMarginPct)}</div>
+            </div>
+          </div>
+        ) : (
         <div className="flex flex-wrap items-center gap-8">
           <div className="flex items-center gap-2">
             <button onClick={() => setMonthCursor((c) => Math.max(0, c - 1))} disabled={monthCursor === 0} className="p-1 rounded disabled:opacity-30" style={{ background: "#2A303B", color: "#EDE7DA" }}><Icon.chevronLeft /></button>
@@ -851,8 +875,78 @@ function OTBEngine() {
             <div style={{ fontFamily: "'Roboto Slab', serif", color: "#D97A6A" }} className="text-2xl font-bold">{money(grandTotalOverstock)}</div>
           </div>
         </div>
+        )}
       </div>
 
+      {showMonthPace && monthPace ? (
+      <div className="px-4 sm:px-8 py-4">
+        <p className="text-xs mb-3" style={{ color: "#5C6270" }}>
+          Read-only pace check, separate from the Over/Under buy logic above. Answers "are we selling ahead of plan enough that reordering now would capture sales we'd otherwise miss" — not a stockout warning.
+        </p>
+        <div style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }} className="rounded-md overflow-hidden">
+          <div style={{ maxHeight: "70vh", overflow: "auto", position: "relative" }}>
+            <table style={{ borderCollapse: "collapse", fontFamily: "'IBM Plex Mono', monospace", width: "max-content", minWidth: "100%" }} className="text-xs sm:text-sm">
+              <thead>
+                <tr>
+                  <th rowSpan={2} style={{ position: "sticky", top: 0, left: 0, zIndex: 4, background: "#20232B", color: "#EDE7DA", minWidth: CATW }} className="text-left py-2 px-3 align-bottom">Category</th>
+                  <th rowSpan={2} style={{ position: "sticky", top: 0, left: CATW, zIndex: 4, background: "#20232B", color: "#EDE7DA", minWidth: TYPEW }} className="text-left py-2 px-3 align-bottom">Product Type</th>
+                  <th colSpan={4} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA" }} className="text-center py-1.5 px-2 border-l">Retail</th>
+                  <th colSpan={4} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA" }} className="text-center py-1.5 px-2 border-l">Cost</th>
+                  <th colSpan={5} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA" }} className="text-center py-1.5 px-2 border-l">Margin %</th>
+                </tr>
+                <tr>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 100 }} className="text-right py-1.5 px-2 border-l">Forecast</th>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 100 }} className="text-right py-1.5 px-2">Expected</th>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 100 }} className="text-right py-1.5 px-2">Actual</th>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 100 }} className="text-right py-1.5 px-2">Diff</th>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 100 }} className="text-right py-1.5 px-2 border-l">Forecast</th>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 100 }} className="text-right py-1.5 px-2">Expected</th>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 100 }} className="text-right py-1.5 px-2">Actual</th>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 100 }} className="text-right py-1.5 px-2">Diff</th>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 85 }} className="text-right py-1.5 px-2 border-l">Plan (GM%)</th>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 85 }} className="text-right py-1.5 px-2">Plan (LY)</th>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 85 }} className="text-right py-1.5 px-2">Actual</th>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 85 }} className="text-right py-1.5 px-2">vs GM%</th>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 85 }} className="text-right py-1.5 px-2">vs LY</th>
+                </tr>
+              </thead>
+              <tbody>
+                {CATEGORIES.map((cat) => {
+                  const ct = monthPace.catTotals[cat];
+                  const isOpen = expandedPaceCat === cat;
+                  return (
+                    <Fragment key={cat}>
+                      <tr className="cursor-pointer" onClick={() => setExpandedPaceCat(isOpen ? null : cat)} style={{ borderTop: "1px solid #EDE9DE", background: "#FAF8F3" }}>
+                        <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#FAF8F3" }} className="py-2 px-3">
+                          <span className="flex items-center gap-1.5">
+                            <span style={{ width: 8, height: 8, borderRadius: 2, background: CATEGORY_COLOR[cat], flexShrink: 0 }} />
+                            {isOpen ? <Icon.chevronUp size={11} /> : <Icon.chevronDown size={11} />}
+                          </span>
+                        </td>
+                        <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#FAF8F3", fontWeight: 700 }} className="py-2 px-3">{cat}</td>
+                        <PaceCells row={ct} />
+                      </tr>
+                      {isOpen && TYPES_BY_CATEGORY[cat].map((type) => (
+                        <tr key={type} style={{ borderTop: "1px solid #EDE9DE" }}>
+                          <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#FFFFFF" }} className="py-1.5 px-3"></td>
+                          <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#FFFFFF" }} className="py-1.5 px-3">{type}</td>
+                          <PaceCells row={monthPace.rows[type]} />
+                        </tr>
+                      ))}
+                    </Fragment>
+                  );
+                })}
+                <tr style={{ borderTop: "2px solid #20232B", background: "#F1EEE6" }}>
+                  <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#F1EEE6" }} className="py-2 px-3"></td>
+                  <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#F1EEE6", fontWeight: 700 }} className="py-2 px-3">STORE TOTAL</td>
+                  <PaceCells row={monthPace.grand} bold />
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      ) : (
       <div className="px-4 sm:px-8 py-4">
         <div className="flex flex-wrap items-center gap-3 mb-3">
           <div className="flex items-center gap-2 px-2 py-1.5 rounded border flex-1 min-w-[200px]" style={{ borderColor: "#DCD5C4", background: "#FFFFFF" }}>
@@ -991,6 +1085,7 @@ function OTBEngine() {
           </span>
         </div>
       </div>
+      )}
 
       {showSync && (
         <Modal onClose={() => setShowSync(false)} title="Live sync from Shopify">
@@ -1102,83 +1197,6 @@ function OTBEngine() {
           )}
           <div className="flex justify-end mt-4">
             <button onClick={() => setShowVendors(false)} className="text-xs px-3 py-2 rounded" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 600 }}>Done</button>
-          </div>
-        </Modal>
-      )}
-
-      {showMonthPace && monthPace && (
-        <Modal onClose={() => setShowMonthPace(false)} title={`Month Pace — ${monthLabel(monthPace.mStr)}`}>
-          <p className="text-sm mb-3" style={{ color: "#5C6270" }}>
-            This is a read-only pace check, separate from the Over/Under buy logic. It answers "are we selling ahead of plan enough that reordering now would capture sales we'd otherwise miss" — not a stockout warning. {monthPace.daysElapsed} of {monthPace.totalDays} days elapsed ({(monthPace.pctElapsed * 100).toFixed(1)}% of the month, calendar days).
-          </p>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
-            <PaceSummaryCard label="Expected-to-date (Retail)" value={money(monthPace.grand.expectedRetail)} />
-            <PaceSummaryCard label="Actual-to-date (Retail)" value={money(monthPace.grand.actualRetail)} />
-            <PaceSummaryCard label="Diff (Retail)" value={money(monthPace.grand.diffRetail)} color={diffColor(monthPace.grand.diffRetail)} />
-            <PaceSummaryCard label="Actual Margin % to date" value={pctStr(monthPace.grand.actualMarginPct)} color={diffColor(monthPace.grand.diffVsGM)} />
-          </div>
-          <div className="overflow-auto border rounded" style={{ borderColor: "#DCD5C4", maxHeight: "65vh" }}>
-            <table style={{ borderCollapse: "collapse", fontFamily: "'IBM Plex Mono', monospace", width: "max-content", minWidth: "100%" }} className="text-xs">
-              <thead>
-                <tr>
-                  <th rowSpan={2} style={{ position: "sticky", top: 0, left: 0, zIndex: 4, background: "#20232B", color: "#EDE7DA", minWidth: CATW }} className="text-left py-2 px-2 align-bottom">Category</th>
-                  <th rowSpan={2} style={{ position: "sticky", top: 0, left: CATW, zIndex: 4, background: "#20232B", color: "#EDE7DA", minWidth: TYPEW }} className="text-left py-2 px-2 align-bottom">Product Type</th>
-                  <th colSpan={4} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA" }} className="text-center py-1.5 px-2 border-l" >Retail</th>
-                  <th colSpan={4} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA" }} className="text-center py-1.5 px-2 border-l">Cost</th>
-                  <th colSpan={5} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA" }} className="text-center py-1.5 px-2 border-l">Margin %</th>
-                </tr>
-                <tr>
-                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2 border-l">Forecast</th>
-                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2">Expected</th>
-                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2">Actual</th>
-                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2">Diff</th>
-                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2 border-l">Forecast</th>
-                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2">Expected</th>
-                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2">Actual</th>
-                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2">Diff</th>
-                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 78 }} className="text-right py-1.5 px-2 border-l">Plan (GM%)</th>
-                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 78 }} className="text-right py-1.5 px-2">Plan (LY)</th>
-                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 78 }} className="text-right py-1.5 px-2">Actual</th>
-                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 78 }} className="text-right py-1.5 px-2">vs GM%</th>
-                  <th style={{ position: "sticky", top: 28, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 78 }} className="text-right py-1.5 px-2">vs LY</th>
-                </tr>
-              </thead>
-              <tbody>
-                {CATEGORIES.map((cat) => {
-                  const ct = monthPace.catTotals[cat];
-                  const isOpen = expandedPaceCat === cat;
-                  return (
-                    <Fragment key={cat}>
-                      <tr className="cursor-pointer" onClick={() => setExpandedPaceCat(isOpen ? null : cat)} style={{ borderTop: "1px solid #EDE9DE", background: "#F1EEE6" }}>
-                        <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#F1EEE6" }} className="py-2 px-2">
-                          <span className="flex items-center gap-1.5">
-                            <span style={{ width: 8, height: 8, borderRadius: 2, background: CATEGORY_COLOR[cat], flexShrink: 0 }} />
-                            {isOpen ? <Icon.chevronUp size={11} /> : <Icon.chevronDown size={11} />}
-                          </span>
-                        </td>
-                        <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#F1EEE6", fontWeight: 700 }} className="py-2 px-2">{cat}</td>
-                        <PaceCells row={ct} />
-                      </tr>
-                      {isOpen && TYPES_BY_CATEGORY[cat].map((type) => (
-                        <tr key={type} style={{ borderTop: "1px solid #EDE9DE" }}>
-                          <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#FFFFFF" }} className="py-1.5 px-2"></td>
-                          <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#FFFFFF" }} className="py-1.5 px-2">{type}</td>
-                          <PaceCells row={monthPace.rows[type]} />
-                        </tr>
-                      ))}
-                    </Fragment>
-                  );
-                })}
-                <tr style={{ borderTop: "2px solid #20232B", background: "#F1EEE6" }}>
-                  <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#F1EEE6" }} className="py-2 px-2"></td>
-                  <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#F1EEE6", fontWeight: 700 }} className="py-2 px-2">STORE TOTAL</td>
-                  <PaceCells row={monthPace.grand} bold />
-                </tr>
-              </tbody>
-            </table>
-          </div>
-          <div className="flex justify-end mt-4">
-            <button onClick={() => setShowMonthPace(false)} className="text-xs px-3 py-2 rounded" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 600 }}>Done</button>
           </div>
         </Modal>
       )}
