@@ -198,9 +198,7 @@ function OTBEngine() {
   const [showMonthPace, setShowMonthPace] = useState(false);
   const [expandedPaceCat, setExpandedPaceCat] = useState(null);
   const [dailySales, setDailySales] = useState({}); // { "YYYY-MM-DD": netSalesAmount } - imported via CSV, since Shopify's live Admin API only reaches back ~60 days, too short to pull LY comparisons directly.
-  const [liveInventory, setLiveInventory] = useState(null); // { totals: {type: {units, value}}, loadedAt } - on-demand snapshot for Month Pace's Weeks of Stock column, separate from the once-a-month Sync Inventory (which sets Starting BOM for planning, not a live "right now" check).
-  const [loadingInventory, setLoadingInventory] = useState(false);
-  const [inventoryStatus, setInventoryStatus] = useState("");
+  const [liveInventory, setLiveInventory] = useState(null); // { totals: {type: {units, value}}, loadedAt } - snapshot for Month Pace's Weeks of Stock column, loaded via CSV import (see "Import current stock" - a live per-variant API pull was tried first but proved too slow/unreliable for a large multi-location catalog).
   const [vendorTable, setVendorTable] = useState(null); // { vendor: { mStr: {sales, cogs, actualMarginPct, plannedMarginPct, marginDiff} } }
   const [vendorMonths, setVendorMonths] = useState([]); // array of "YYYY-MM" strings, loaded range
   const [vendorStatus, setVendorStatus] = useState("");
@@ -690,7 +688,6 @@ function OTBEngine() {
       matched++;
     });
     setLiveInventory({ totals, loadedAt: new Date(), truncated: false, variantsScanned: variantCount, source: "import" });
-    setInventoryStatus("");
     setImportSummary(`Imported current stock from ${variantCount} variant row(s), matched ${matched} to a Product Type${skipped ? `, skipped ${skipped}` : ""}.`);
     setShowImport(false); setImportText(""); setImportPreview(null);
   }
@@ -861,23 +858,6 @@ function OTBEngine() {
       setVendorStatus("Failed to load: " + e.message);
     }
     setLoadingVendors(false);
-  }
-
-  // On-demand "right now" stock check for Month Pace - separate from the monthly Sync Inventory
-  // (which sets Starting BOM for planning purposes and is restricted to once/month by design).
-  // This can be re-run any time to answer "is this specific item actually running low."
-  async function checkCurrentStock() {
-    setLoadingInventory(true);
-    setInventoryStatus("Checking current stock…");
-    try {
-      const res = await fetch(`/inventory-by-type`).then((r) => r.json());
-      if (res.error) throw new Error(res.error);
-      setLiveInventory({ totals: res.totals || {}, loadedAt: new Date(), truncated: !!res.truncated, variantsScanned: res.variantsScanned, source: "live" });
-      setInventoryStatus(`Checked ${new Date().toLocaleTimeString()} - scanned ${res.variantsScanned} variant(s)${res.truncated ? ". ⚠ Catalog is larger than the scan limit - numbers below are a PARTIAL count, not trustworthy yet. Let me know and I'll raise the limit further." : ", full catalog."}`);
-    } catch (e) {
-      setInventoryStatus("Failed to check stock: " + e.message);
-    }
-    setLoadingInventory(false);
   }
 
   async function syncInventory() {
@@ -1074,15 +1054,11 @@ function OTBEngine() {
           {!monthPace.usingWeekdayMatch && (monthPace.dailyPace.windowDaysFound > 0 || monthPace.dailyPace.monthDaysFound > 0) && (
             <span className="text-xs" style={{ color: "#8C6E4A" }}>Partial data loaded: {monthPace.dailyPace.monthDaysFound}/{monthPace.dailyPace.monthDaysTotal} days of LY month, {monthPace.dailyPace.windowDaysFound}/{monthPace.dailyPace.windowDaysTotal} of the comparison window.</span>
           )}
-          <button onClick={checkCurrentStock} disabled={loadingInventory} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
-            <Icon.refresh /> {loadingInventory ? "Checking…" : "Check current stock (live)"}
-          </button>
           <button onClick={() => { setShowImport(true); setImportFormat("stock"); }} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5" style={{ background: "#20232B", color: "#F1EEE6" }}>
             <Icon.upload /> Import current stock (CSV)
           </button>
-          {inventoryStatus && <span className="text-xs" style={{ color: (inventoryStatus.startsWith("Failed") || inventoryStatus.includes("⚠")) ? "#B5432D" : "#5B7A5B" }}>{inventoryStatus}</span>}
-          {liveInventory && liveInventory.source === "import" && !inventoryStatus && (
-            <span className="text-xs" style={{ color: "#5B7A5B" }}>Using imported stock snapshot from {liveInventory.loadedAt.toLocaleString()} ({liveInventory.variantsScanned} variants).</span>
+          {liveInventory && (
+            <span className="text-xs" style={{ color: "#5B7A5B" }}>Using stock snapshot from {liveInventory.loadedAt.toLocaleString()} ({liveInventory.variantsScanned} variants).</span>
           )}
         </div>
         <div style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }} className="rounded-md overflow-hidden">
@@ -1457,7 +1433,7 @@ function OTBEngine() {
             <b>Daily sales (by date):</b> a Day/Date column plus a Net Sales column, store-wide (not per Product Type) — e.g. Shopify's own "Sales over time" report exported to CSV. Powers Month Pace's weekday-matched Expected-to-date, since Shopify's live API can't reach back a year on its own. Import LY's full month at minimum; safe to re-import/add more dates any time, existing dates just get overwritten.
           </div>
           <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
-            <b>Current stock:</b> Shopify's own product export (Products → Export → CSV) — uses its Type, Variant Inventory Qty, and Cost per item columns. Powers Month Pace's Weeks of Stock column - faster and more reliable than the live "Check current stock" pull for a large catalog, since it doesn't need to page through Shopify's API one variant-batch at a time. Re-importing replaces the whole stock snapshot.
+            <b>Current stock:</b> Shopify's own product export (Products → Export → CSV) — uses its Type, Variant Inventory Qty, and Cost per item columns. Powers Month Pace's Weeks of Stock column. Note: if your store tracks inventory at more than one location, Shopify leaves Variant Inventory Qty out of this export - you'll need to merge in a separate Inventory export (Products → Inventory → Export, filtered to your real location) yourself first. Re-importing replaces the whole stock snapshot.
           </div>
           {importSummary && <div className="text-xs mb-3 p-2 rounded" style={{ background: "#EDF3EA", color: "#5B7A5B" }}>{importSummary}</div>}
           <div className="flex gap-2 mb-3">
