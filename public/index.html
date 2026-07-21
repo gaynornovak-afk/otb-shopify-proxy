@@ -828,8 +828,8 @@ function OTBEngine() {
     try {
       const res = await fetch(`/inventory-by-type`).then((r) => r.json());
       if (res.error) throw new Error(res.error);
-      setLiveInventory({ totals: res.totals || {}, loadedAt: new Date() });
-      setInventoryStatus(`Checked ${new Date().toLocaleTimeString()}${res.truncated ? " (large catalog - some items may be missing)" : ""}.`);
+      setLiveInventory({ totals: res.totals || {}, loadedAt: new Date(), truncated: !!res.truncated, variantsScanned: res.variantsScanned });
+      setInventoryStatus(`Checked ${new Date().toLocaleTimeString()} - scanned ${res.variantsScanned} variant(s)${res.truncated ? ". ⚠ Catalog is larger than the scan limit - numbers below are a PARTIAL count, not trustworthy yet. Let me know and I'll raise the limit further." : ", full catalog."}`);
     } catch (e) {
       setInventoryStatus("Failed to check stock: " + e.message);
     }
@@ -1033,7 +1033,7 @@ function OTBEngine() {
           <button onClick={checkCurrentStock} disabled={loadingInventory} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
             <Icon.refresh /> {loadingInventory ? "Checking…" : "Check current stock"}
           </button>
-          {inventoryStatus && <span className="text-xs" style={{ color: inventoryStatus.startsWith("Failed") ? "#B5432D" : "#5B7A5B" }}>{inventoryStatus}</span>}
+          {inventoryStatus && <span className="text-xs" style={{ color: (inventoryStatus.startsWith("Failed") || inventoryStatus.includes("⚠")) ? "#B5432D" : "#5B7A5B" }}>{inventoryStatus}</span>}
         </div>
         <div style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }} className="rounded-md overflow-hidden">
           <div style={{ maxHeight: "70vh", overflow: "auto", position: "relative" }}>
