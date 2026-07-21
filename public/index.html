@@ -198,6 +198,9 @@ function OTBEngine() {
   const [showMonthPace, setShowMonthPace] = useState(false);
   const [expandedPaceCat, setExpandedPaceCat] = useState(null);
   const [dailySales, setDailySales] = useState({}); // { "YYYY-MM-DD": netSalesAmount } - imported via CSV, since Shopify's live Admin API only reaches back ~60 days, too short to pull LY comparisons directly.
+  const [liveInventory, setLiveInventory] = useState(null); // { totals: {type: {units, value}}, loadedAt } - on-demand snapshot for Month Pace's Weeks of Stock column, separate from the once-a-month Sync Inventory (which sets Starting BOM for planning, not a live "right now" check).
+  const [loadingInventory, setLoadingInventory] = useState(false);
+  const [inventoryStatus, setInventoryStatus] = useState("");
   const [vendorTable, setVendorTable] = useState(null); // { vendor: { mStr: {sales, cogs, actualMarginPct, plannedMarginPct, marginDiff} } }
   const [vendorMonths, setVendorMonths] = useState([]); // array of "YYYY-MM" strings, loaded range
   const [vendorStatus, setVendorStatus] = useState("");
@@ -391,10 +394,21 @@ function OTBEngine() {
       const diffVsGM = actualMarginPct === null ? null : actualMarginPct - plannedMarginGM;
       const diffVsLY = (actualMarginPct === null || plannedMarginLY === null) ? null : actualMarginPct - plannedMarginLY;
 
+      // Weeks of Stock remaining, using cost $ (matches how inventory is valued elsewhere).
+      // Weekly rate prefers this month's actual run-rate once we have any actuals (most current
+      // signal for "should I reorder now"); falls back to the flat forecast rate early in the
+      // month before there's enough actual data to trust.
+      const weeklyRate = (actualCost !== null && daysElapsed > 0) ? (actualCost / daysElapsed) * 7 : (forecastCost / totalDays) * 7;
+      const currentStockValue = liveInventory ? (liveInventory.totals[type] ? liveInventory.totals[type].value : 0) : null;
+      const weeksOfStock = (currentStockValue !== null && weeklyRate > 0) ? currentStockValue / weeklyRate : null;
+      const weeksTarget = a.wosTarget;
+      const weeksDiff = weeksOfStock === null ? null : weeksOfStock - weeksTarget;
+
       rows[type] = {
         cat, forecastRetail, forecastCost, expectedRetail, expectedCost,
         actualRetail, actualCost, diffRetail, diffCost,
         plannedMarginGM, plannedMarginLY, actualMarginPct, diffVsGM, diffVsLY,
+        weeklyRate, currentStockValue, weeksOfStock, weeksTarget, weeksDiff,
       };
     });
 
@@ -404,6 +418,7 @@ function OTBEngine() {
       let forecastRetail = 0, forecastCost = 0, expectedRetail = 0, expectedCost = 0;
       let actualRetail = 0, actualCost = 0, anyActuals = false;
       let lySalesSum = 0, lyCogsSum = 0, weightedGM = 0, gmWeight = 0;
+      let stockSum = 0, anyStock = false, rateSum = 0, weightedWeeksTarget = 0, weeksTargetWeight = 0;
       types.forEach((t) => {
         const r = rows[t];
         forecastRetail += r.forecastRetail; forecastCost += r.forecastCost;
@@ -412,10 +427,15 @@ function OTBEngine() {
         const row = getRow(t, mStr);
         lySalesSum += num(row.lySales); lyCogsSum += num(row.lyCogs);
         weightedGM += r.plannedMarginGM * r.forecastRetail; gmWeight += r.forecastRetail;
+        if (r.currentStockValue !== null) { stockSum += r.currentStockValue; anyStock = true; }
+        rateSum += r.weeklyRate;
+        weightedWeeksTarget += r.weeksTarget * r.weeklyRate; weeksTargetWeight += r.weeklyRate;
       });
       const plannedMarginGM = gmWeight > 0 ? weightedGM / gmWeight : null;
       const plannedMarginLY = lySalesSum > 0 ? ((lySalesSum - lyCogsSum) / lySalesSum) * 100 : null;
       const actualMarginPct = anyActuals && actualRetail > 0 ? ((actualRetail - actualCost) / actualRetail) * 100 : null;
+      const weeksOfStock = (anyStock && rateSum > 0) ? stockSum / rateSum : null;
+      const weeksTarget = weeksTargetWeight > 0 ? weightedWeeksTarget / weeksTargetWeight : null;
       return {
         forecastRetail, forecastCost, expectedRetail, expectedCost,
         actualRetail: anyActuals ? actualRetail : null, actualCost: anyActuals ? actualCost : null,
@@ -424,6 +444,8 @@ function OTBEngine() {
         plannedMarginGM, plannedMarginLY, actualMarginPct,
         diffVsGM: actualMarginPct !== null && plannedMarginGM !== null ? actualMarginPct - plannedMarginGM : null,
         diffVsLY: actualMarginPct !== null && plannedMarginLY !== null ? actualMarginPct - plannedMarginLY : null,
+        currentStockValue: anyStock ? stockSum : null, weeksOfStock, weeksTarget,
+        weeksDiff: weeksOfStock !== null && weeksTarget !== null ? weeksOfStock - weeksTarget : null,
       };
     }
 
@@ -432,7 +454,7 @@ function OTBEngine() {
     const grand = rollUp(TAXONOMY.map(([t]) => t));
 
     return { mStr, pctElapsed, daysElapsed, totalDays, rows, catTotals, grand, usingWeekdayMatch, dailyPace };
-  }, [data, assumptions, months, dailySales]);
+  }, [data, assumptions, months, dailySales, liveInventory]);
 
   const filteredTaxonomy = filterSelection === "all" ? TAXONOMY
     : filterSelection.startsWith("cat:") ? TAXONOMY.filter(([, cat]) => cat === filterSelection.slice(4))
@@ -797,6 +819,23 @@ function OTBEngine() {
     setLoadingVendors(false);
   }
 
+  // On-demand "right now" stock check for Month Pace - separate from the monthly Sync Inventory
+  // (which sets Starting BOM for planning purposes and is restricted to once/month by design).
+  // This can be re-run any time to answer "is this specific item actually running low."
+  async function checkCurrentStock() {
+    setLoadingInventory(true);
+    setInventoryStatus("Checking current stock…");
+    try {
+      const res = await fetch(`/inventory-by-type`).then((r) => r.json());
+      if (res.error) throw new Error(res.error);
+      setLiveInventory({ totals: res.totals || {}, loadedAt: new Date() });
+      setInventoryStatus(`Checked ${new Date().toLocaleTimeString()}${res.truncated ? " (large catalog - some items may be missing)" : ""}.`);
+    } catch (e) {
+      setInventoryStatus("Failed to check stock: " + e.message);
+    }
+    setLoadingInventory(false);
+  }
+
   async function syncInventory() {
     setSyncing(true);
     setSyncStatus("Syncing current inventory…");
@@ -979,18 +1018,22 @@ function OTBEngine() {
       {showMonthPace && monthPace ? (
       <div className="px-4 sm:px-8 py-4">
         <p className="text-xs mb-2" style={{ color: "#5C6270" }}>
-          Read-only pace check, separate from the Over/Under buy logic above. Answers "are we selling ahead of plan enough that reordering now would capture sales we'd otherwise miss" — not a stockout warning.
+          Read-only pace check, separate from the Over/Under buy logic above. Answers "should I reorder this now to capture sales I'd otherwise miss" — combining whether an item is outperforming plan (Diff columns) with whether it's actually running low (Weeks left, right side) - overperforming alone isn't urgent if there's still plenty of stock.
           {monthPace.usingWeekdayMatch
             ? ` Expected-to-date uses imported daily sales for the weekday-matched window ${monthPace.dailyPace.windowStart} – ${monthPace.dailyPace.windowEnd} (not raw calendar dates) as a store-wide pacing ratio applied to each row's own forecast - respects both the shape of the month and day-of-week traffic, the same approach Shopify's own reports use.`
             : ` Expected-to-date is currently a flat estimate (forecast ÷ days, prorated evenly) - Shopify's live API only reaches back ~60 days, too short for a year-ago comparison, so the more accurate weekday-matched version needs daily sales imported via CSV for LY's full ${monthLabel(`${monthPace.dailyPace.monthStart.slice(0,7)}`)} (has ${monthPace.dailyPace.monthDaysFound} of ${monthPace.dailyPace.monthDaysTotal} days so far).`}
         </p>
-        <div className="flex items-center gap-3 mb-3">
+        <div className="flex flex-wrap items-center gap-3 mb-3">
           <button onClick={() => { setShowImport(true); setImportFormat("dailySales"); }} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5" style={{ background: "#20232B", color: "#F1EEE6" }}>
             <Icon.upload /> Import daily sales
           </button>
           {!monthPace.usingWeekdayMatch && (monthPace.dailyPace.windowDaysFound > 0 || monthPace.dailyPace.monthDaysFound > 0) && (
             <span className="text-xs" style={{ color: "#8C6E4A" }}>Partial data loaded: {monthPace.dailyPace.monthDaysFound}/{monthPace.dailyPace.monthDaysTotal} days of LY month, {monthPace.dailyPace.windowDaysFound}/{monthPace.dailyPace.windowDaysTotal} of the comparison window.</span>
           )}
+          <button onClick={checkCurrentStock} disabled={loadingInventory} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
+            <Icon.refresh /> {loadingInventory ? "Checking…" : "Check current stock"}
+          </button>
+          {inventoryStatus && <span className="text-xs" style={{ color: inventoryStatus.startsWith("Failed") ? "#B5432D" : "#5B7A5B" }}>{inventoryStatus}</span>}
         </div>
         <div style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }} className="rounded-md overflow-hidden">
           <div style={{ maxHeight: "70vh", overflow: "auto", position: "relative" }}>
@@ -1002,6 +1045,7 @@ function OTBEngine() {
                   <th colSpan={4} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA" }} className="text-center py-1.5 px-2 border-l">Retail</th>
                   <th colSpan={4} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA" }} className="text-center py-1.5 px-2 border-l">Cost</th>
                   <th colSpan={5} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA" }} className="text-center py-1.5 px-2 border-l">Margin %</th>
+                  <th colSpan={2} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA" }} className="text-center py-1.5 px-2 border-l">Stock</th>
                 </tr>
                 <tr>
                   <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 100 }} className="text-right py-1.5 px-2 border-l">Forecast</th>
@@ -1017,6 +1061,8 @@ function OTBEngine() {
                   <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 85 }} className="text-right py-1.5 px-2">Actual</th>
                   <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 85 }} className="text-right py-1.5 px-2">vs GM%</th>
                   <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 85 }} className="text-right py-1.5 px-2">vs LY</th>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2 border-l">Weeks left</th>
+                  <th style={{ position: "sticky", top: 33, zIndex: 3, background: "#242933", color: "#C7CCD6", minWidth: 90 }} className="text-right py-1.5 px-2">vs Target</th>
                 </tr>
               </thead>
               <tbody>
@@ -1480,6 +1526,8 @@ function PaceCells({ row, bold }) {
       <td className="text-right py-1.5 px-2" style={{ fontWeight: fw }}>{pctStr(row.actualMarginPct)}</td>
       <td className="text-right py-1.5 px-2" style={{ fontWeight: fw, color: diffColor(row.diffVsGM) }}>{row.diffVsGM === null ? "—" : `${row.diffVsGM >= 0 ? "+" : ""}${row.diffVsGM.toFixed(1)}pt`}</td>
       <td className="text-right py-1.5 px-2" style={{ fontWeight: fw, color: diffColor(row.diffVsLY) }}>{row.diffVsLY === null ? "—" : `${row.diffVsLY >= 0 ? "+" : ""}${row.diffVsLY.toFixed(1)}pt`}</td>
+      <td className="text-right py-1.5 px-2 border-l" style={{ fontWeight: fw }}>{row.weeksOfStock === null ? "—" : `${row.weeksOfStock.toFixed(1)} wks`}</td>
+      <td className="text-right py-1.5 px-2" style={{ fontWeight: fw, color: diffColor(row.weeksDiff) }}>{row.weeksDiff === null ? "—" : `${row.weeksDiff >= 0 ? "+" : ""}${row.weeksDiff.toFixed(1)} wks`}</td>
     </Fragment>
   );
 }
