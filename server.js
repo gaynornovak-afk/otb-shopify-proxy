@@ -37,15 +37,27 @@ const app = express();
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.static(require("path").join(__dirname, "public")));
 
-async function shopifyGraphQL(query, variables) {
-  const res = await fetch(`https://${STORE}/admin/api/${API_VERSION}/graphql.json`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": TOKEN },
-    body: JSON.stringify({ query, variables }),
-  });
-  const data = await res.json();
-  if (data.errors) throw new Error(JSON.stringify(data.errors));
-  return data.data;
+async function shopifyGraphQL(query, variables, retries = 5) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(`https://${STORE}/admin/api/${API_VERSION}/graphql.json`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": TOKEN },
+      body: JSON.stringify({ query, variables }),
+    });
+    const data = await res.json();
+    const throttled = data.errors && Array.isArray(data.errors) && data.errors.some((e) => e.extensions?.code === "THROTTLED");
+    if (throttled && attempt < retries) {
+      // Shopify's GraphQL API uses a cost-based leaky-bucket limit - back off and let it refill
+      // rather than failing outright, since a full catalog scan can burn through it quickly.
+      const wait = data.extensions?.cost?.throttleStatus?.restoreRate
+        ? Math.ceil(1000 / data.extensions.cost.throttleStatus.restoreRate) * 200
+        : 1000 * (attempt + 1);
+      await new Promise((r) => setTimeout(r, wait));
+      continue;
+    }
+    if (data.errors) throw new Error(JSON.stringify(data.errors));
+    return data.data;
+  }
 }
 
 app.get("/health", (req, res) => res.json({ ok: true, store: STORE }));
@@ -385,7 +397,12 @@ app.get("/inventory-by-type", async (req, res) => {
   let cursor = null;
   let hasNextPage = true;
   let pages = 0;
-  const MAX_PAGES = 60;
+  let variantsScanned = 0;
+  // 500 pages x 100 variants = up to 50,000 variants - comfortably covers a boutique's full
+  // catalog. Previously capped at 60 pages (6,000 variants), which silently truncated the scan
+  // partway through the catalog and made Weeks of Stock numbers look near-zero across the board
+  // for anything not reached before the cap.
+  const MAX_PAGES = 500;
 
   const query = `
     query($cursor: String) {
@@ -413,11 +430,12 @@ app.get("/inventory-by-type", async (req, res) => {
         const units = node.inventoryQuantity || 0;
         const unitCost = parseFloat(node.inventoryItem?.unitCost?.amount || 0);
         addTotal(type, units, units * unitCost);
+        variantsScanned++;
       });
       hasNextPage = data.productVariants.pageInfo.hasNextPage;
       pages++;
     }
-    res.json({ totals, truncated: hasNextPage, pagesScanned: pages });
+    res.json({ totals, truncated: hasNextPage, pagesScanned: pages, variantsScanned });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: String(err.message || err) });
