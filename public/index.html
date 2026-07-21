@@ -793,17 +793,30 @@ function OTBEngine() {
       if (cur.error) throw new Error(cur.error);
       if (ly.error) throw new Error(ly.error);
       let matched = 0;
+      // Only current-period totals get force-set to 0 when a type has no matching orders this
+      // pull - this is what clears stale dollars when an order's product gets reclassified into
+      // a different Product Type after the fact. LY totals are left as "patch only if present":
+      // Shopify's live order-history API can't reliably reach a year back, so an empty LY result
+      // usually just means that pull was blocked, not that LY genuinely had zero sales - blindly
+      // zeroing it would wipe out real historical data.
+      const curHasAnyData = cur.totals && Object.keys(cur.totals).length > 0;
       TAXONOMY.forEach(([type]) => {
         const c = cur.totals?.[type];
         const l = ly.totals?.[type];
-        if (!c && !l) return;
-        matched++;
         const patch = {};
-        if (c) { patch.actualSales = Number(c.sales.toFixed(2)); patch.actualCogs = Number(c.cogs.toFixed(2)); }
+        if (curHasAnyData) {
+          patch.actualSales = Number((c ? c.sales : 0).toFixed(2));
+          patch.actualCogs = Number((c ? c.cogs : 0).toFixed(2));
+        }
         if (l) { patch.lySales = Number(l.sales.toFixed(2)); patch.lyCogs = Number(l.cogs.toFixed(2)); }
+        if (Object.keys(patch).length === 0) return;
+        matched++;
         setRow(type, mStr, patch);
       });
-      setSyncStatus(`Synced ${matched} of ${TAXONOMY.length} product types for ${monthLabel(mStr)}.`);
+      const lyEmpty = !ly.totals || Object.keys(ly.totals).length === 0;
+      setSyncStatus(`Synced ${matched} of ${TAXONOMY.length} product types for ${monthLabel(mStr)}.`
+        + (!curHasAnyData ? " ⚠ No current-period sales came back at all - if this month should have sales, the pull may have failed rather than the month genuinely being empty." : "")
+        + (lyEmpty ? " (No LY data returned - normal if this month is more than ~60 days in the past; Shopify's live API can't reach back that far for LY.)" : ""));
     } catch (e) { setSyncStatus("Sync failed: " + e.message); }
     setSyncing(false);
   }
