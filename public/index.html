@@ -499,6 +499,12 @@ function OTBEngine() {
           setImportPreview(res.data.slice(0, 5000));
           return;
         }
+        const isStockFormat = cols.includes("Type") && cols.some((c) => /variant inventory qty/i.test(c)) && cols.some((c) => /cost per item/i.test(c));
+        if (isStockFormat) {
+          setImportFormat("stock");
+          setImportPreview(res.data.slice(0, 60000));
+          return;
+        }
         setImportFormat("generic");
         const required = ["Product Type", "Month"];
         const missing = required.filter((r) => !cols.includes(r));
@@ -531,6 +537,7 @@ function OTBEngine() {
     if (importFormat === "po") { applyPOImport(); return; }
     if (importFormat === "bom") { applyBOMImport(); return; }
     if (importFormat === "dailySales") { applyDailySalesImport(); return; }
+    if (importFormat === "stock") { applyStockImport(); return; }
     const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
     setData((prev) => {
       const next = { ...prev };
@@ -648,6 +655,43 @@ function OTBEngine() {
     });
     setDailySales((prev) => ({ ...prev, ...updates }));
     setImportSummary(`Imported daily sales for ${matched} day(s)${skipped ? `, skipped ${skipped} row(s) that didn't parse` : ""}.`);
+    setShowImport(false); setImportText(""); setImportPreview(null);
+  }
+  // Aggregates Shopify's native product export (one row per variant) into inventory value per
+  // Product Type, feeding straight into the same liveInventory shape the live "Check current
+  // stock" pull uses - Weeks of Stock doesn't care which source it came from. Handles Shopify's
+  // export quirk where "Type" is sometimes only populated on a product's first variant row, by
+  // forward-filling it per Handle.
+  function applyStockImport() {
+    const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
+    const cols = Object.keys(importPreview[0] || {});
+    const typeCol = "Type";
+    const qtyCol = cols.find((c) => /variant inventory qty/i.test(c));
+    const costCol = cols.find((c) => /cost per item/i.test(c));
+    const handleCol = cols.find((c) => /^handle$/i.test(c));
+    if (!qtyCol || !costCol) { setImportError("Could not find Variant Inventory Qty and Cost per item columns in this file."); return; }
+    const totals = {};
+    let lastType = "";
+    let matched = 0, skipped = 0, variantCount = 0;
+    importPreview.forEach((r) => {
+      const handleVal = handleCol ? r[handleCol] : null;
+      let typeName = (r[typeCol] || "").trim();
+      if (!typeName && lastType) typeName = lastType; // forward-fill from the product's first row
+      if (typeName) lastType = typeName;
+      const qty = Number(r[qtyCol]);
+      if (isNaN(qty)) { skipped++; return; } // blank qty = a non-variant summary row in some exports; skip quietly
+      variantCount++;
+      if (!typeName || !validTypes.has(typeName.toLowerCase())) { skipped++; return; }
+      const match = TAXONOMY.find((t) => t[0].toLowerCase() === typeName.toLowerCase())[0];
+      const cost = Number(String(r[costCol] ?? "").replace(/[^0-9.\-]/g, "")) || 0;
+      if (!totals[match]) totals[match] = { units: 0, value: 0 };
+      totals[match].units += qty;
+      totals[match].value += qty * cost;
+      matched++;
+    });
+    setLiveInventory({ totals, loadedAt: new Date(), truncated: false, variantsScanned: variantCount, source: "import" });
+    setInventoryStatus("");
+    setImportSummary(`Imported current stock from ${variantCount} variant row(s), matched ${matched} to a Product Type${skipped ? `, skipped ${skipped}` : ""}.`);
     setShowImport(false); setImportText(""); setImportPreview(null);
   }
   function handleFileUpload(e) {
@@ -828,7 +872,7 @@ function OTBEngine() {
     try {
       const res = await fetch(`/inventory-by-type`).then((r) => r.json());
       if (res.error) throw new Error(res.error);
-      setLiveInventory({ totals: res.totals || {}, loadedAt: new Date(), truncated: !!res.truncated, variantsScanned: res.variantsScanned });
+      setLiveInventory({ totals: res.totals || {}, loadedAt: new Date(), truncated: !!res.truncated, variantsScanned: res.variantsScanned, source: "live" });
       setInventoryStatus(`Checked ${new Date().toLocaleTimeString()} - scanned ${res.variantsScanned} variant(s)${res.truncated ? ". ⚠ Catalog is larger than the scan limit - numbers below are a PARTIAL count, not trustworthy yet. Let me know and I'll raise the limit further." : ", full catalog."}`);
     } catch (e) {
       setInventoryStatus("Failed to check stock: " + e.message);
@@ -1031,9 +1075,15 @@ function OTBEngine() {
             <span className="text-xs" style={{ color: "#8C6E4A" }}>Partial data loaded: {monthPace.dailyPace.monthDaysFound}/{monthPace.dailyPace.monthDaysTotal} days of LY month, {monthPace.dailyPace.windowDaysFound}/{monthPace.dailyPace.windowDaysTotal} of the comparison window.</span>
           )}
           <button onClick={checkCurrentStock} disabled={loadingInventory} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
-            <Icon.refresh /> {loadingInventory ? "Checking…" : "Check current stock"}
+            <Icon.refresh /> {loadingInventory ? "Checking…" : "Check current stock (live)"}
+          </button>
+          <button onClick={() => { setShowImport(true); setImportFormat("stock"); }} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5" style={{ background: "#20232B", color: "#F1EEE6" }}>
+            <Icon.upload /> Import current stock (CSV)
           </button>
           {inventoryStatus && <span className="text-xs" style={{ color: (inventoryStatus.startsWith("Failed") || inventoryStatus.includes("⚠")) ? "#B5432D" : "#5B7A5B" }}>{inventoryStatus}</span>}
+          {liveInventory && liveInventory.source === "import" && !inventoryStatus && (
+            <span className="text-xs" style={{ color: "#5B7A5B" }}>Using imported stock snapshot from {liveInventory.loadedAt.toLocaleString()} ({liveInventory.variantsScanned} variants).</span>
+          )}
         </div>
         <div style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }} className="rounded-md overflow-hidden">
           <div style={{ maxHeight: "70vh", overflow: "auto", position: "relative" }}>
@@ -1406,6 +1456,9 @@ function OTBEngine() {
           <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
             <b>Daily sales (by date):</b> a Day/Date column plus a Net Sales column, store-wide (not per Product Type) — e.g. Shopify's own "Sales over time" report exported to CSV. Powers Month Pace's weekday-matched Expected-to-date, since Shopify's live API can't reach back a year on its own. Import LY's full month at minimum; safe to re-import/add more dates any time, existing dates just get overwritten.
           </div>
+          <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
+            <b>Current stock:</b> Shopify's own product export (Products → Export → CSV) — uses its Type, Variant Inventory Qty, and Cost per item columns. Powers Month Pace's Weeks of Stock column - faster and more reliable than the live "Check current stock" pull for a large catalog, since it doesn't need to page through Shopify's API one variant-batch at a time. Re-importing replaces the whole stock snapshot.
+          </div>
           {importSummary && <div className="text-xs mb-3 p-2 rounded" style={{ background: "#EDF3EA", color: "#5B7A5B" }}>{importSummary}</div>}
           <div className="flex gap-2 mb-3">
             <button onClick={() => fileInputRef.current?.click()} className="text-xs px-3 py-1.5 rounded flex items-center gap-1" style={{ background: "#20232B", color: "#F1EEE6" }}>
@@ -1417,7 +1470,7 @@ function OTBEngine() {
           {importError && <div className="text-xs mt-2" style={{ color: "#B5432D" }}>{importError}</div>}
           {importPreview && (
             <div className="mt-3 text-xs max-h-40 overflow-y-auto border rounded p-2" style={{ borderColor: "#DCD5C4" }}>
-              <div className="mb-1" style={{ color: "#8C6E4A", fontWeight: 600 }}>Detected format: {importFormat === "po" ? "PO/receiving export" : importFormat === "bom" ? "Starting BOM template" : importFormat === "dailySales" ? "Daily sales (by date)" : "Actuals/plan"} ({importPreview.length} rows)</div>
+              <div className="mb-1" style={{ color: "#8C6E4A", fontWeight: 600 }}>Detected format: {importFormat === "po" ? "PO/receiving export" : importFormat === "bom" ? "Starting BOM template" : importFormat === "dailySales" ? "Daily sales (by date)" : importFormat === "stock" ? "Current stock (Shopify product export)" : "Actuals/plan"} ({importPreview.length} rows)</div>
               {importPreview.slice(0, 8).map((r, i) => (
                 <div key={i} style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
                   {importFormat === "po"
@@ -1426,6 +1479,8 @@ function OTBEngine() {
                     ? `${r[Object.keys(r).find((c) => c.toLowerCase().includes("shopify product type"))]} · ${r[Object.keys(r).find((c) => c.toLowerCase().includes("beginning inv"))]}`
                     : importFormat === "dailySales"
                     ? `${r[Object.keys(r).find((c) => /^(day|date)$/i.test(c.trim()))]} · ${r[Object.keys(r).find((c) => /sales/i.test(c))]}`
+                    : importFormat === "stock"
+                    ? `${r["Type"] || "(blank - forward-filled)"} · qty ${r[Object.keys(r).find((c) => /variant inventory qty/i.test(c))]} · cost ${r[Object.keys(r).find((c) => /cost per item/i.test(c))]}`
                     : `${r["Product Type"]} · ${r["Month"]} · LY Sales ${r["LY Sales"] ?? "—"} · LY COGS ${r["LY COGS"] ?? "—"}`}
                 </div>
               ))}
