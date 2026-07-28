@@ -128,7 +128,7 @@ app.get("/sales-by-type", async (req, res) => {
             edges {
               cursor
               node {
-                currentSubtotalPriceSet { shopMoney { amount } }
+                subtotalPriceSet { shopMoney { amount } }
                 lineItems(first: 100) {
                   edges {
                     node {
@@ -164,7 +164,7 @@ app.get("/sales-by-type", async (req, res) => {
             lineItemSum += sales;
             orderLines.push({ type, sales, cogs });
           });
-          const orderSubtotal = parseFloat(node.currentSubtotalPriceSet?.shopMoney?.amount ?? lineItemSum);
+          const orderSubtotal = parseFloat(node.subtotalPriceSet?.shopMoney?.amount ?? lineItemSum);
           const extraDiscount = lineItemSum - orderSubtotal; // positive = order-level discount not captured per-line
           orderLines.forEach((line) => {
             let adjustedSales = line.sales;
