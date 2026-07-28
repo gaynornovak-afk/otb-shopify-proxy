@@ -442,4 +442,108 @@ app.get("/inventory-by-type", async (req, res) => {
   }
 });
 
+// GET /line-items?type=5203%20Bracelets&start=2026-07-01&end=2026-07-31
+// Debug tool: shows the raw per-order math behind /sales-by-type for one product type,
+// so a category total can be audited order-by-order against Shopify's own reports.
+app.get("/line-items", async (req, res) => {
+  const { type, start, end } = req.query;
+  if (!type || !start || !end) return res.status(400).json({ error: "type, start, and end are required" });
+
+  const rows = [];
+  function inRange(isoDateTime) {
+    const d = (isoDateTime || "").slice(0, 10);
+    return d >= start && d <= end;
+  }
+
+  try {
+    // Same "created in window" pass as /sales-by-type, but recording per-order detail
+    // instead of totals.
+    {
+      const searchQuery = `created_at:>=${start} AND created_at:<=${end} AND -status:cancelled`;
+      let cursor = null, hasNextPage = true, pages = 0;
+      const query = `
+        query($cursor: String, $searchQuery: String!) {
+          orders(first: 50, after: $cursor, query: $searchQuery) {
+            edges {
+              cursor
+              node {
+                name
+                createdAt
+                currentSubtotalPriceSet { shopMoney { amount } }
+                subtotalPriceSet { shopMoney { amount } }
+                lineItems(first: 100) {
+                  edges {
+                    node {
+                      title
+                      quantity
+                      isGiftCard
+                      discountedTotalSet { shopMoney { amount } }
+                      product { productType }
+                    }
+                  }
+                }
+                refunds {
+                  createdAt
+                  refundLineItems(first: 100) {
+                    edges {
+                      node {
+                        subtotalSet { shopMoney { amount } }
+                        lineItem { isGiftCard product { productType } title }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            pageInfo { hasNextPage }
+          }
+        }
+      `;
+      while (hasNextPage && pages < 40) {
+        const data = await shopifyGraphQL(query, { cursor, searchQuery });
+        data.orders.edges.forEach(({ node, cursor: c }) => {
+          cursor = c;
+          let lineItemSum = 0, lineItemSumAll = 0;
+          const matchingLines = [];
+          node.lineItems.edges.forEach(({ node: li }) => {
+            const sales = parseFloat(li.discountedTotalSet.shopMoney.amount || 0);
+            lineItemSumAll += sales;
+            if (li.isGiftCard) return;
+            lineItemSum += sales;
+            if (li.product?.productType === type) matchingLines.push({ title: li.title, qty: li.quantity, discountedTotal: sales });
+          });
+          const orderSubtotal = parseFloat(node.subtotalPriceSet?.shopMoney?.amount ?? lineItemSumAll);
+          const extraDiscount = lineItemSumAll - orderSubtotal;
+          const matchingRefunds = [];
+          node.refunds.forEach((refund) => {
+            refund.refundLineItems.edges.forEach(({ node: rli }) => {
+              if (rli.lineItem?.isGiftCard) return;
+              if (rli.lieuItem?.product?.productType !== type && rli.lineItem?.product?.productType !== type) return;
+              matchingRefunds.push({
+                refundDate: refund.createdAt, inRange: inRange(refund.createdAt),
+                title: rli.lineItem?.title, amount: parseFloat(rli.subtotalSet.shopMoney.amount || 0),
+              });
+            });
+          });
+          if (matchingLines.length || matchingRefunds.length) {
+            rows.push({
+              order: node.name, createdAt: node.createdAt,
+              currentSubtotal: node.currentSubtotalPriceSet?.shopMoney?.amount,
+              subtotal: node.subtotalPriceSet?.shopMoney?.amount,
+              lineItemSum, lineItemSumAll, extraDiscount,
+              matchingLines, matchingRefunds,
+            });
+          }
+        });
+        hasNextPage = data.orders.pageInfo.hasNextPage;
+        pages++;
+      }
+    }
+    res.json({ type, start, end, orders: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 app.listen(PORT, () => console.log(`OTB Shopify proxy listening on :${PORT}`));
