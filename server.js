@@ -477,16 +477,27 @@ app.get("/line-items", async (req, res) => {
                 currentSubtotalPriceSet { shopMoney { amount } }
                 subtotalPriceSet { shopMoney { amount } }
                 lineItems(first: 100) {
-                  edges {
-                    node {
-                      title
-                      quantity
-                      isGiftCard
-                      discountedTotalSet { shopMoney { amount } }
-                      product { productType }
-                    }
-                  }
-                }
+  edges {
+    node {
+      title
+      quantity
+      isGiftCard
+      originalTotalSet { shopMoney { amount } }
+      discountedTotalSet { shopMoney { amount } }
+      discountAllocations {
+        allocatedAmountSet { shopMoney { amount } }
+        discountApplication {
+          allocationMethod
+          targetSelection
+          ... on ManualDiscountApplication { title }
+          ... on DiscountCodeApplication { code }
+          ... on AutomaticDiscountApplication { title }
+        }
+      }
+      product { productType }
+    }
+  }
+}
                 refunds {
                   createdAt
                   refundLineItems(first: 100) {
@@ -515,7 +526,20 @@ app.get("/line-items", async (req, res) => {
             lineItemSumAll += sales;
             if (li.isGiftCard) return;
             lineItemSum += sales;
-            if (li.product?.productType === type) matchingLines.push({ title: li.title, qty: li.quantity, discountedTotal: sales });
+            if (li.product?.productType === type) {
+  matchingLines.push({
+    title: li.title,
+    qty: li.quantity,
+    originalTotal: parseFloat(li.originalTotalSet?.shopMoney?.amount || 0),
+    discountedTotal: sales,
+    discountAllocations: (li.discountAllocations || []).map((da) => ({
+      amount: parseFloat(da.allocatedAmountSet?.shopMoney?.amount || 0),
+      title: da.discountApplication?.title || da.discountApplication?.code || "(unnamed)",
+      allocationMethod: da.discountApplication?.allocationMethod,
+      targetSelection: da.discountApplication?.targetSelection,
+    })),
+  });
+}
           });
           const orderSubtotal = parseFloat(node.subtotalPriceSet?.shopMoney?.amount ?? lineItemSumAll);
           const extraDiscount = lineItemSumAll - orderSubtotal;
