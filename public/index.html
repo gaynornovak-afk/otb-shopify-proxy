@@ -1025,10 +1025,19 @@ function OTBEngine() {
               <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">Actual-to-date (Retail)</div>
               <div style={{ fontFamily: "'Roboto Slab', serif", color: "#EDE7DA" }} className="text-2xl font-bold">{money(monthPace.grand.actualRetail)}</div>
             </div>
-            <div>
-              <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">Diff (Retail)</div>
-              <div style={{ fontFamily: "'Roboto Slab', serif", color: diffColor(monthPace.grand.diffRetail) }} className="text-2xl font-bold">{money(monthPace.grand.diffRetail)}</div>
-            </div>
+
+<div>
+  <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">Diff (Retail)</div>
+  <div style={{ fontFamily: "'Roboto Slab', serif", color: diffColor(monthPace.grand.diffRetail) }} className="text-2xl font-bold">
+    {money(monthPace.grand.diffRetail)}
+    {monthPace.grand.diffRetail !== null && monthPace.grand.expectedRetail > 0 && (
+      <span className="text-sm font-normal ml-1">
+        ({monthPace.grand.diffRetail >= 0 ? "+" : ""}{((monthPace.grand.diffRetail / monthPace.grand.expectedRetail) * 100).toFixed(1)}%)
+      </span>
+    )}
+  </div>
+</div>
+            
             <div>
               <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">Actual Margin % to date</div>
               <div style={{ fontFamily: "'Roboto Slab', serif", color: diffColor(monthPace.grand.diffVsGM) }} className="text-2xl font-bold">{pctStr(monthPace.grand.actualMarginPct)}</div>
