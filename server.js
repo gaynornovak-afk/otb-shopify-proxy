@@ -154,25 +154,30 @@ app.get("/sales-by-type", async (req, res) => {
           // order's actual subtotal - catches order-level discounts (e.g. loyalty point
           // redemptions) that don't show up on any individual line item's own discount field.
           const orderLines = [];
-          let lineItemSum = 0;
-          node.lineItems.edges.forEach(({ node: li }) => {
-            if (li.isGiftCard) return; // gift card sales aren't revenue
-            const type = li.product?.productType;
-            const sales = parseFloat(li.discountedTotalSet.shopMoney.amount || 0);
-            const unitCost = parseFloat(li.variant?.inventoryItem?.unitCost?.amount || 0);
-            const cogs = unitCost * li.quantity;
-            lineItemSum += sales;
-            orderLines.push({ type, sales, cogs });
-          });
-          const orderSubtotal = parseFloat(node.subtotalPriceSet?.shopMoney?.amount ?? lineItemSum);
-          const extraDiscount = lineItemSum - orderSubtotal; // positive = order-level discount not captured per-line
-          orderLines.forEach((line) => {
-            let adjustedSales = line.sales;
-            if (extraDiscount > 0.01 && lineItemSum > 0) {
-              adjustedSales -= extraDiscount * (line.sales / lineItemSum);
-            }
-            addTotal(line.type, adjustedSales, line.cogs);
-          });
+let lineItemSum = 0;    // non-gift-card only - used to attribute dollars to categories
+let lineItemSumAll = 0; // includes gift cards - used to reconcile against the order subtotal
+node.lineItems.edges.forEach(({ node: li }) => {
+  const sales = parseFloat(li.discountedTotalSet.shopMoney.amount || 0);
+  lineItemSumAll += sales;
+  if (li.isGiftCard) return; // gift card sales aren't revenue
+  const type = li.product?.productType;
+  const unitCost = parseFloat(li.variant?.inventoryItem?.unitCost?.amount || 0);
+  const cogs = unitCost * li.quantity;
+  lineItemSum += sales;
+  orderLines.push({ type, sales, cogs });
+});
+const orderSubtotal = parseFloat(node.subtotalPriceSet?.shopMoney?.amount ?? lineItemSumAll);
+const extraDiscount = lineItemSumAll - orderSubtotal;
+orderLines.forEach((line) => {
+  let adjustedSales = line.sales;
+  if (Math.abs(extraDiscount) > 0.01 && lineItemSum > 0) {
+    // Spread the order-level discount proportionally across the non-gift-card lines only
+    // (using their share of the non-gift-card total) - any portion that would've landed on
+    // a gift card line is simply dropped, since gift card sales aren't tracked as revenue.
+    adjustedSales -= extraDiscount * (line.sales / lineItemSum);
+  }
+  addTotal(line.type, adjustedSales, line.cogs);
+});
         });
         hasNextPage = data.orders.pageInfo.hasNextPage;
         pages++;
