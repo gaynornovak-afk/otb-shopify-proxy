@@ -1,4 +1,5 @@
 
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -874,26 +875,12 @@ function OTBEngine() {
     setLoadingVendors(false);
   }
 
-  async function syncInventory() {
-    setSyncing(true);
-    setSyncStatus("Syncing current inventory…");
-    try {
-      const res = await fetch(`/inventory-by-type`).then((r) => r.json());
-      if (res.error) throw new Error(res.error);
-      let matched = 0;
-      TAXONOMY.forEach(([type]) => {
-        const t = res.totals?.[type];
-        if (!t) return;
-        matched++;
-        // Inventory sync always sets the Starting Actual BOM $ (your "right now" position),
-        // regardless of which month is on screen - it's a live snapshot, not tied to a
-        // future month's plan.
-        setStartingBOM((prev) => ({ ...prev, [type]: Number(t.value.toFixed(2)) }));
-      });
-      setSyncStatus(`Set starting inventory for ${matched} of ${TAXONOMY.length} product types.`);
-    } catch (e) { setSyncStatus("Sync failed: " + e.message); }
-    setSyncing(false);
-  }
+  // NOTE: syncInventory (live "Sync Inventory" button) was removed - Shopify's inventoryQuantity
+  // field sums across ALL locations, including a store's fake/PO-only location, which silently
+  // corrupted Starting Actual BOM $ for multi-location stores. Starting BOM is now set only via
+  // the "Starting BOM template" CSV import (Planning Category, Shopify Product Type, Plan Month,
+  // Beginning Inv $), built from a location-filtered export - see applyBOMImport below.
+
   // Suggests a Growth % per category based on the last 3 completed calendar months'
   // actual sales vs. the same 3 months a year earlier - a data-driven starting point
   // instead of guessing, using sales data already flowing through the live sync.
@@ -1294,26 +1281,28 @@ function OTBEngine() {
       {showSync && (
         <Modal onClose={() => setShowSync(false)} title="Live sync from Shopify">
           <p className="text-sm mb-3" style={{ color: "#5C6270" }}>
-            This page is served directly by your Shopify proxy, so sync talks to it automatically - no URL to paste. Pulls Actual Sales, Actual COGS, LY Sales/COGS, and current inventory value. Received $ and Balance to Receive $ still need to be entered by hand.
+            This page is served directly by your Shopify proxy, so sync talks to it automatically - no URL to paste. Pulls Actual Sales, Actual COGS, and LY Sales/COGS. Received $, Balance to Receive $, and Starting Actual BOM $ still need to be entered by hand - see Import above.
           </p>
           <div className="flex gap-2 mb-3">
             <button onClick={testConnection} className="text-xs px-3 py-1.5 rounded" style={{ background: "#E6E1D6" }}>Test connection</button>
           </div>
           <div className="p-3 rounded mb-3" style={{ background: "#F1EEE6" }}>
-            <div className="text-xs mb-2" style={{ color: "#5C6270" }}>Sales & COGS sync into: <b>{monthLabel(months[monthCursor])}</b> (change with the dashboard arrows). Inventory sync always sets your Starting Actual BOM $, regardless of month shown.</div>
+            <div className="text-xs mb-2" style={{ color: "#5C6270" }}>Sales & COGS sync into: <b>{monthLabel(months[monthCursor])}</b> (change with the dashboard arrows).</div>
             <div className="flex gap-2 flex-wrap">
               <button onClick={syncSales} disabled={syncing} className="text-xs px-3 py-2 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
                 <Icon.refresh /> Sync Sales & COGS
               </button>
-              <button onClick={syncInventory} disabled={syncing} className="text-xs px-3 py-2 rounded flex items-center gap-1.5 disabled:opacity-50" style={{ background: "#20232B", color: "#F1EEE6" }}>
-                <Icon.refresh /> Sync Inventory
-              </button>
+            </div>
+          </div>
+          <div className="p-3 rounded mb-3" style={{ background: "#F1EEE6" }}>
+            <div className="text-xs mb-2" style={{ color: "#5C6270" }}>
+              Starting Actual BOM $ (what's physically on the shelf right now) is set via Import → "Starting BOM template" - Planning Category, Shopify Product Type, Plan Month, Beginning Inv $. There used to be a live "Sync Inventory" button here, but it was removed: Shopify's inventory API sums stock across ALL locations, including a store's fake/PO-only location if it has one, which silently corrupted this number for multi-location setups. The CSV import lets you filter to your real location first.
             </div>
           </div>
           <div className="p-3 rounded mb-3" style={{ background: "#FBF6EA" }}>
-            <div className="text-xs mb-2" style={{ color: "#5C6270" }}>If Inventory sync was run earlier while viewing a future month, it may have left stray $0 (or other) overrides sitting in "Actual BOM $ (override)" for months after July. This clears those out (leaves July's Starting BOM untouched) so those months roll forward normally again.</div>
+            <div className="text-xs mb-2" style={{ color: "#5C6270" }}>Legacy cleanup: if the old live Inventory sync was ever run while viewing a future month, it may have left stray $0 (or other) overrides sitting in "Actual BOM $ (override)" for months after that point. This clears those out (leaves the current month's Starting BOM untouched) so those months roll forward normally again.</div>
             <button onClick={clearStrayBOMOverrides} className="text-xs px-3 py-2 rounded flex items-center gap-1.5" style={{ background: "#B5432D", color: "#FBF6EA" }}>
-              Clear stray BOM overrides (Aug onward)
+              Clear stray BOM overrides ({monthLabel(months[Math.min(monthCursor + 1, 11)])} onward)
             </button>
           </div>
           {syncStatus && <div className="text-xs" style={{ color: syncStatus.startsWith("Sync failed") || syncStatus.startsWith("Could not") ? "#B5432D" : "#5B7A5B" }}>{syncStatus}</div>}
