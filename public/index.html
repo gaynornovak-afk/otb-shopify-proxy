@@ -1,5 +1,6 @@
 
 
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -96,6 +97,37 @@ const CATEGORIES = [...new Set(TAXONOMY.map((t) => t[1]))];
 const CATEGORY_COLOR = Object.fromEntries(CATEGORIES.map((c, i) => [c, SWATCHES[i % SWATCHES.length]]));
 const TYPES_BY_CATEGORY = Object.fromEntries(CATEGORIES.map((c) => [c, TAXONOMY.filter((t) => t[1] === c).map((t) => t[0])]));
 
+// --- Planning groups ---------------------------------------------------------
+// A planning group pools product types the customer treats as interchangeable:
+// solid vs printed, and the silhouettes a fashion season rotates through (slim
+// vs wide leg). Buys and over/under NET within a group before anything is called
+// a "buy" - a top a shopper can't find in one type she just buys in another.
+// Shopify product types are never touched; this is a planning layer on top.
+const DEFAULT_GROUP_OF = {
+  // Tops: Fashion Tops + both Tees/Tunics all read as "a top" to the customer
+  "1100 Fashion Tops": "Tops", "1101 Tees/Tunics Solid": "Tops", "1102 Tees/Tunics Printed": "Tops",
+  // Tanks: solid + printed
+  "1103 Tanks Solid": "Tanks", "1104 Tanks Printed": "Tanks",
+  // Blouses: solid + printed (kept separate from Tops on purpose)
+  "1105 Blouses/Shirts Solid": "Blouses", "1106 Blouses/Shirts Printed": "Blouses",
+  // Pants: every silhouette the trend rotates through - NOT tights/skirts/shorts
+  "3101 Bootcut Pants": "Pants", "3102 Flare Pants": "Pants", "3103 Wide Leg Pants": "Pants",
+  "3104 Jogger Pants": "Pants", "3105 Slim Leg Pants": "Pants", "3106 Straight Pants": "Pants",
+  "3110 Fashion Pant": "Pants",
+  // Dresses: solid + printed
+  "4101 Solid Dresses": "Dresses", "4102 Printed Dresses": "Dresses",
+  // Jumpsuits: solid + printed
+  "4103 Solid Jumpsuits": "Jumpsuits", "4104 Printed Jumpsuits": "Jumpsuits",
+};
+// Anything not listed above falls back to its own category as its group, so the
+// default is "category-level, but with Tops merged and Pants split out from the
+// tights/skirts/shorts basics." Everything is editable in the Groups panel.
+function defaultPlanGroups() {
+  const m = {};
+  TAXONOMY.forEach(([type, cat]) => { m[type] = DEFAULT_GROUP_OF[type] || cat; });
+  return m;
+}
+
 const METRICS = [
   { key: "overUnder", label: "Over/Under $" },
   { key: "targetEOM", label: "Target EOM $" },
@@ -188,7 +220,10 @@ function OTBEngine() {
   const [loaded, setLoaded] = useState(false);
   const [saveState, setSaveState] = useState("idle");
   const [filterSelection, setFilterSelection] = useState("all");
-  const [groupByCategory, setGroupByCategory] = useState(false);
+  const [viewMode, setViewMode] = useState("type"); // "type" | "category" | "group"
+  const [planGroups, setPlanGroups] = useState(defaultPlanGroups()); // { [type]: groupName }
+  const [showGroups, setShowGroups] = useState(false);
+  const [expandedGroup, setExpandedGroup] = useState(null);
   const [metric, setMetric] = useState("overUnder");
   const [showImport, setShowImport] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -231,6 +266,7 @@ function OTBEngine() {
           setStartingBOM(parsed.startingBOM || {});
           setData(parsed.data || {});
           setDailySales(parsed.dailySales || {});
+          setPlanGroups(parsed.planGroups && Object.keys(parsed.planGroups).length ? parsed.planGroups : defaultPlanGroups());
           loadedFromServer = true;
         }
       } catch (e) { /* server unreachable or not configured yet - fall through to local copy below */ }
@@ -245,6 +281,7 @@ function OTBEngine() {
             setStartingBOM(parsed.startingBOM || {});
             setData(parsed.data || {});
             setDailySales(parsed.dailySales || {});
+            setPlanGroups(parsed.planGroups && Object.keys(parsed.planGroups).length ? parsed.planGroups : defaultPlanGroups());
           }
         } catch (e2) { /* first run, nothing anywhere yet */ }
       }
@@ -256,7 +293,7 @@ function OTBEngine() {
     if (!loaded) return;
     setSaveState("saving");
     const t = setTimeout(async () => {
-      const payload = { assumptions, startingBOM, data, dailySales };
+      const payload = { assumptions, startingBOM, data, dailySales, planGroups };
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payload)); // always keep a local backup copy too
       } catch (e) { /* ignore quota errors */ }
@@ -266,7 +303,7 @@ function OTBEngine() {
       } catch (e) { setSaveState("saved locally only"); }
     }, 400);
     return () => clearTimeout(t);
-  }, [assumptions, startingBOM, data, dailySales, loaded]);
+  }, [assumptions, startingBOM, data, dailySales, planGroups, loaded]);
 
   function getAssumptions(cat) { return assumptions[cat] || defaultAssumptions(); }
   function setAssumption(cat, patch) { setAssumptions((prev) => ({ ...prev, [cat]: { ...getAssumptions(cat), ...patch } })); }
@@ -344,6 +381,25 @@ function OTBEngine() {
     TAXONOMY.forEach(([type, cat]) => { m[type] = computeSeries(type, cat); });
     return m;
   }, [data, assumptions, startingBOM, months]);
+
+  // Planning groups: ordered list of group names + the types in each, derived
+  // from the type->group map. A type with a blank assignment stands alone.
+  const groupNames = useMemo(() => {
+    const seen = [];
+    TAXONOMY.forEach(([type]) => { const g = planGroups[type] || type; if (!seen.includes(g)) seen.push(g); });
+    return seen;
+  }, [planGroups]);
+  const typesByGroup = useMemo(() => {
+    const m = {};
+    TAXONOMY.forEach(([type]) => { const g = planGroups[type] || type; (m[g] = m[g] || []).push(type); });
+    return m;
+  }, [planGroups]);
+  // Over/under for a set of types in a given month = plain sum (it aggregates
+  // linearly), which is exactly the point: an overstocked type nets against a
+  // needed buy inside the same group before we floor at zero.
+  function groupOverUnderAt(types, monthIdx) {
+    return types.reduce((sum, t) => sum + seriesByType[t][monthIdx].overUnder, 0);
+  }
 
   // Month Pace: for the current real-world month (months[0]), compares actual sales/COGS-to-date
   // against where we'd expect to be given the forecast and how far through the calendar month we are.
@@ -460,17 +516,17 @@ function OTBEngine() {
     : filterSelection.startsWith("cat:") ? TAXONOMY.filter(([, cat]) => cat === filterSelection.slice(4))
     : TAXONOMY.filter(([type]) => type === filterSelection.slice(5));
 
-  function categoryBuyTotal(cat, monthIdx) {
-    return TYPES_BY_CATEGORY[cat].reduce((sum, t) => sum + Math.max(seriesByType[t][monthIdx].overUnder, 0), 0);
-  }
-  const categoryTotalsThisMonth = useMemo(() => {
-    const o = {};
-    CATEGORIES.forEach((c) => { o[c] = categoryBuyTotal(c, monthCursor); });
-    return o;
-  }, [seriesByType, monthCursor]);
-
-  const grandTotalBuy = Object.values(categoryTotalsThisMonth).reduce((a, b) => a + b, 0);
-  const grandTotalOverstock = CATEGORIES.reduce((sum, cat) => sum + TYPES_BY_CATEGORY[cat].reduce((s2, t) => s2 + Math.min(seriesByType[t][monthCursor].overUnder, 0), 0), 0);
+  // Headline totals net WITHIN each planning group before flooring at zero, so a
+  // type you're overstocked in (wide leg) offsets one you need to buy (slim leg)
+  // when they're really the same decision - a truer, smaller buy number.
+  const grandTotalBuy = useMemo(
+    () => groupNames.reduce((sum, g) => sum + Math.max(groupOverUnderAt(typesByGroup[g], monthCursor), 0), 0),
+    [groupNames, typesByGroup, seriesByType, monthCursor]
+  );
+  const grandTotalOverstock = useMemo(
+    () => groupNames.reduce((sum, g) => sum + Math.min(groupOverUnderAt(typesByGroup[g], monthCursor), 0), 0),
+    [groupNames, typesByGroup, seriesByType, monthCursor]
+  );
 
   const expandedSeries = expandedType ? seriesByType[expandedType] : null;
   const chartData = expandedSeries ? expandedSeries.map((s) => ({ month: monthLabel(s.mKey), value: Math.round(s.overUnder) })) : [];
@@ -987,6 +1043,9 @@ function OTBEngine() {
             <button onClick={() => setShowSettings(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
               <Icon.sliders /> Assumptions
             </button>
+            <button onClick={() => { setViewMode("group"); setShowGroups(true); }} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
+              <Icon.sliders /> Groups
+            </button>
             <button onClick={() => setShowImport(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
               <Icon.upload /> Import
             </button>
@@ -1159,9 +1218,18 @@ function OTBEngine() {
             </select>
           </label>
           <label className="text-xs flex items-center gap-1.5" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
-            <input type="checkbox" checked={groupByCategory} onChange={(e) => setGroupByCategory(e.target.checked)} />
-            Group by category
+            View
+            <select value={viewMode} onChange={(e) => setViewMode(e.target.value)} className="border rounded px-2 py-1.5 text-xs" style={{ borderColor: "#DCD5C4", background: "#FFFFFF" }}>
+              <option value="type">Product type</option>
+              <option value="category">Category</option>
+              <option value="group">Planning group</option>
+            </select>
           </label>
+          {viewMode === "group" && (
+            <button onClick={() => setShowGroups(true)} className="text-xs px-2.5 py-1.5 rounded flex items-center gap-1.5" style={{ background: "#20232B", color: "#F1EEE6" }}>
+              <Icon.sliders /> Edit groups
+            </button>
+          )}
           <div className="flex items-center gap-1">
             <button onClick={() => setScrollStart((s) => Math.max(0, s - 1))} disabled={scrollStart === 0} className="p-1.5 rounded disabled:opacity-30" style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }}><Icon.chevronLeft /></button>
             <span style={{ fontFamily: "'IBM Plex Mono', monospace" }} className="text-xs text-[#5C6270] w-28 text-center">{monthLabel(months[scrollStart])} – {monthLabel(months[Math.min(scrollStart + visibleMonths - 1, 11)])}</span>
@@ -1183,7 +1251,7 @@ function OTBEngine() {
                 </tr>
               </thead>
               <tbody>
-                {groupByCategory ? (
+                {viewMode === "category" ? (
                   filteredCategories.map((cat) => {
                     const typesInCat = filteredTaxonomy.filter(([, c]) => c === cat).map(([t]) => t);
                     return (
@@ -1203,6 +1271,69 @@ function OTBEngine() {
                         })}
                         <td></td>
                       </tr>
+                    );
+                  })
+                ) : viewMode === "group" ? (
+                  groupNames.map((g) => {
+                    const gtypes = typesByGroup[g];
+                    const gOpen = expandedGroup === g;
+                    return (
+                      <Fragment key={g}>
+                        <tr className="cursor-pointer" onClick={() => setExpandedGroup(gOpen ? null : g)} style={{ borderTop: "1px solid #EDE9DE" }}>
+                          <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#FFFFFF" }} className="py-2 px-3">
+                            <span className="flex items-center gap-1.5">
+                              <span style={{ width: 8, height: 8, borderRadius: 2, background: "#C99A3C", flexShrink: 0 }} />
+                              <span style={{ fontSize: 11, color: "#5C6270" }}>group</span>
+                            </span>
+                          </td>
+                          <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#FFFFFF", color: "#20232B", fontWeight: 700 }} className="py-2 px-3">{g} <span style={{ color: "#8B8F98", fontWeight: 400 }}>({gtypes.length})</span></td>
+                          {visibleMonthKeys.map((m, i) => {
+                            const v = sumMetricForTypes(gtypes, i);
+                            if (v === null) return <td key={i} className="text-right py-2 px-3" style={{ color: "#B0B4BC" }}>—</td>;
+                            const cellColor = metric === "overUnder" ? (v > 0 ? "#5B7A5B" : v < 0 ? "#B5432D" : "#20232B") : (v < 0 ? "#B5432D" : "#20232B");
+                            return <td key={i} className="text-right py-2 px-3" style={{ color: cellColor, fontWeight: 700 }}>{money(v)}</td>;
+                          })}
+                          <td className="text-center py-2">{gOpen ? <Icon.chevronUp /> : <Icon.chevronDown />}</td>
+                        </tr>
+                        {gOpen && gtypes.map((type) => {
+                          const series = seriesByType[type];
+                          const tOpen = expandedType === type;
+                          return (
+                            <Fragment key={type}>
+                              <tr className="cursor-pointer" onClick={() => setExpandedType(tOpen ? null : type)} style={{ background: "#FAF8F3", borderTop: "1px solid #EDE9DE" }}>
+                                <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#FAF8F3" }} className="py-1.5 px-3"></td>
+                                <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#FAF8F3", color: "#5C6270" }} className="py-1.5 px-3 pl-6">{type}</td>
+                                {series.slice(scrollStart, scrollStart + visibleMonths).map((s, i) => {
+                                  const v = metricValue(s, metric);
+                                  if (metric === "buyAction") {
+                                    const actionColor = v === "Buy" ? "#5B7A5B" : v === "Don't Buy" ? "#B5432D" : "#8C6E4A";
+                                    return <td key={i} className="text-right py-1.5 px-3"><span className="px-2 py-0.5 rounded-full text-[10px]" style={{ background: `${actionColor}22`, color: actionColor, fontWeight: 700 }}>{v}</span></td>;
+                                  }
+                                  const cellColor = metric === "overUnder" ? (v > 0 ? "#5B7A5B" : v < 0 ? "#B5432D" : "#20232B") : (v < 0 ? "#B5432D" : "#20232B");
+                                  return <td key={i} className="text-right py-1.5 px-3" style={{ color: cellColor }}>{money(v)}</td>;
+                                })}
+                                <td className="text-center py-1.5">{tOpen ? <Icon.chevronUp /> : <Icon.chevronDown />}</td>
+                              </tr>
+                              {tOpen && (
+                                <tr>
+                                  <td colSpan={visibleMonths + 3} style={{ background: "#FAF8F3", position: "sticky", left: 0 }} className="p-3">
+                                    <div style={{ width: "min(90vw, 900px)" }}>
+                                      <TypeDetail
+                                        type={type} months={months} series={series}
+                                        scrollStart={scrollStart} setScrollStart={setScrollStart} visibleMonths={visibleMonths}
+                                        getRow={getRow} setRow={setRow}
+                                        startingBOM={startingBOM[type]}
+                                        setStartingBOM={(v) => setStartingBOM((prev) => ({ ...prev, [type]: v }))}
+                                        chartData={chartData}
+                                      />
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                            </Fragment>
+                          );
+                        })}
+                      </Fragment>
                     );
                   })
                 ) : (
@@ -1425,6 +1556,35 @@ function OTBEngine() {
           </div>
           <div className="flex justify-end mt-4">
             <button onClick={() => setShowSettings(false)} className="text-xs px-3 py-2 rounded" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 600 }}>Done</button>
+          </div>
+        </Modal>
+      )}
+
+      {showGroups && (
+        <Modal onClose={() => setShowGroups(false)} title="Planning groups">
+          <div className="p-3 rounded mb-3" style={{ background: "#F1EEE6" }}>
+            <div className="text-xs mb-2" style={{ color: "#5C6270" }}>
+              Pool the product types your customer treats as interchangeable - solid vs printed, or the silhouettes a season rotates through (slim vs wide leg). Buys and overstock net <b>within</b> a group before anything is called a buy, so a type you're overstocked in offsets one you need. Your Shopify product types are never changed - this is a planning layer only. Type a new name to create a group; clear a box to plan that type on its own.
+            </div>
+            <button onClick={() => setPlanGroups(defaultPlanGroups())} className="text-xs px-3 py-2 rounded flex items-center gap-1.5" style={{ background: "#20232B", color: "#F1EEE6" }}>
+              <Icon.refresh /> Reset to suggested groups
+            </button>
+          </div>
+          <datalist id="planGroupNames">{groupNames.map((g) => <option key={g} value={g} />)}</datalist>
+          <div className="space-y-1.5 max-h-96 overflow-y-auto">
+            {TAXONOMY.map(([type, cat]) => (
+              <div key={type} className="flex items-center gap-2 p-2 rounded border text-xs" style={{ borderColor: "#DCD5C4" }}>
+                <span style={{ width: 9, height: 9, borderRadius: 2, background: CATEGORY_COLOR[cat], flexShrink: 0 }} />
+                <span className="flex-1 min-w-0">
+                  <span style={{ fontWeight: 500 }}>{type}</span>
+                  <span style={{ color: "#8B8F98" }} className="block text-[10px]">{cat}</span>
+                </span>
+                <input list="planGroupNames" value={planGroups[type] || ""} onChange={(e) => setPlanGroups((prev) => ({ ...prev, [type]: e.target.value }))} placeholder="(on its own)" className="w-40 border rounded px-2 py-1" style={{ borderColor: "#DCD5C4" }} />
+              </div>
+            ))}
+          </div>
+          <div className="flex justify-end mt-4">
+            <button onClick={() => setShowGroups(false)} className="text-xs px-3 py-2 rounded" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 600 }}>Done</button>
           </div>
         </Modal>
       )}
