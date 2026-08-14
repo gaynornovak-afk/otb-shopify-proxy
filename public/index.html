@@ -1,6 +1,7 @@
 
 
 
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -267,6 +268,7 @@ function OTBEngine() {
           setData(parsed.data || {});
           setDailySales(parsed.dailySales || {});
           setPlanGroups(parsed.planGroups && Object.keys(parsed.planGroups).length ? parsed.planGroups : defaultPlanGroups());
+          if (parsed.liveInventory) setLiveInventory({ ...parsed.liveInventory, loadedAt: parsed.liveInventory.loadedAt ? new Date(parsed.liveInventory.loadedAt) : new Date() });
           loadedFromServer = true;
         }
       } catch (e) { /* server unreachable or not configured yet - fall through to local copy below */ }
@@ -282,6 +284,7 @@ function OTBEngine() {
             setData(parsed.data || {});
             setDailySales(parsed.dailySales || {});
             setPlanGroups(parsed.planGroups && Object.keys(parsed.planGroups).length ? parsed.planGroups : defaultPlanGroups());
+            if (parsed.liveInventory) setLiveInventory({ ...parsed.liveInventory, loadedAt: parsed.liveInventory.loadedAt ? new Date(parsed.liveInventory.loadedAt) : new Date() });
           }
         } catch (e2) { /* first run, nothing anywhere yet */ }
       }
@@ -293,7 +296,7 @@ function OTBEngine() {
     if (!loaded) return;
     setSaveState("saving");
     const t = setTimeout(async () => {
-      const payload = { assumptions, startingBOM, data, dailySales, planGroups };
+      const payload = { assumptions, startingBOM, data, dailySales, planGroups, liveInventory };
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payload)); // always keep a local backup copy too
       } catch (e) { /* ignore quota errors */ }
@@ -303,7 +306,7 @@ function OTBEngine() {
       } catch (e) { setSaveState("saved locally only"); }
     }, 400);
     return () => clearTimeout(t);
-  }, [assumptions, startingBOM, data, dailySales, planGroups, loaded]);
+  }, [assumptions, startingBOM, data, dailySales, planGroups, liveInventory, loaded]);
 
   function getAssumptions(cat) { return assumptions[cat] || defaultAssumptions(); }
   function setAssumption(cat, patch) { setAssumptions((prev) => ({ ...prev, [cat]: { ...getAssumptions(cat), ...patch } })); }
