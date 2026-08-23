@@ -2,6 +2,7 @@
 
 
 
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -620,16 +621,20 @@ function OTBEngine() {
   }
   // Aggregates a line-item PO/receiving export (Product Type, Expected Date, Received Date,
   // Total Cost Ordered, Total Cost Received) into Received $ / Balance to Receive $ per
-  // product type per month. Re-importing overwrites those two fields with freshly computed
-  // totals for that type+month (not additive), so it's safe to re-run with an updated export.
+  // product type per month. Re-importing REPLACES those two fields for every product type that
+  // appears in the file - each such type is cleared across all 12 months first, then rewritten
+  // from the file. That matters because PO dates move: if a PO slips from September to October,
+  // a month-by-month overwrite would write the new October balance but leave September's stale
+  // balance stranded, and the engine would count those dollars as inbound twice. Types absent
+  // from the file are left untouched, so a partial export (one vendor, say) is still safe.
   function applyPOImport() {
     const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
     const monthOf = (dateStr) => { const s = (dateStr || "").trim(); return /^\d{4}-\d{2}/.test(s) ? s.slice(0, 7) : null; };
     const totals = {}; // type -> month -> { received, balance }
-    let matchedRows = 0;
+    let matchedRows = 0, skippedRows = 0;
     importPreview.forEach((r) => {
       const typeName = (r["Product Type"] || "").trim();
-      if (!typeName || !validTypes.has(typeName.toLowerCase())) return;
+      if (!typeName || !validTypes.has(typeName.toLowerCase())) { skippedRows++; return; }
       const match = TAXONOMY.find((t) => t[0].toLowerCase() === typeName.toLowerCase())[0];
       const ordered = Number(r["Total Cost Ordered"]) || 0;
       const received = Number(r["Total Cost Received"]) || 0;
@@ -651,6 +656,12 @@ function OTBEngine() {
       const next = { ...prev };
       Object.entries(totals).forEach(([type, byMonth]) => {
         const typeData = { ...(next[type] || {}) };
+        // Wipe this type's on-order everywhere before rewriting it, so months that dropped out
+        // of the export (a moved expected date, a cancelled PO) don't keep their old dollars.
+        // Only these two fields are touched - LY sales, actuals and overrides are preserved.
+        Object.keys(typeData).forEach((mKey) => {
+          typeData[mKey] = { ...typeData[mKey], received: 0, balanceToReceive: 0 };
+        });
         Object.entries(byMonth).forEach(([mKey, vals]) => {
           const existing = typeData[mKey] || emptyRow();
           typeData[mKey] = { ...existing, received: Number(vals.received.toFixed(2)), balanceToReceive: Number(vals.balance.toFixed(2)) };
@@ -659,7 +670,8 @@ function OTBEngine() {
       });
       return next;
     });
-    setImportSummary(`Applied ${matchedRows} line items across ${Object.keys(totals).length} product types.`);
+    setImportSummary(`Applied ${matchedRows} line items across ${Object.keys(totals).length} product types (on-order replaced for those types).`
+      + (skippedRows ? ` ⚠ Skipped ${skippedRows} row(s) whose Product Type didn't match the taxonomy - those POs are NOT counted as inbound.` : ""));
     setShowImport(false); setImportText(""); setImportPreview(null);
   }
   // Applies a "Beginning Inv $" / starting BOM template (Planning Category, Shopify Product
