@@ -3,6 +3,7 @@
 
 
 
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -98,6 +99,7 @@ const TAXONOMY = [
 const CATEGORIES = [...new Set(TAXONOMY.map((t) => t[1]))];
 const CATEGORY_COLOR = Object.fromEntries(CATEGORIES.map((c, i) => [c, SWATCHES[i % SWATCHES.length]]));
 const TYPES_BY_CATEGORY = Object.fromEntries(CATEGORIES.map((c) => [c, TAXONOMY.filter((t) => t[1] === c).map((t) => t[0])]));
+const CATEGORY_OF = Object.fromEntries(TAXONOMY.map((t) => [t[0], t[1]]));
 
 // --- Planning groups ---------------------------------------------------------
 // A planning group pools product types the customer treats as interchangeable:
@@ -132,6 +134,7 @@ function defaultPlanGroups() {
 
 const METRICS = [
   { key: "overUnder", label: "Over/Under $" },
+  { key: "buyPlan", label: "Buy Plan $ (what to write)" },
   { key: "targetEOM", label: "Target EOM $" },
   { key: "wosTargetEOM", label: "WOS Target EOM $" },
   { key: "basis", label: "BOM $" },
@@ -143,6 +146,9 @@ const METRICS = [
 function metricValue(s, key) {
   if (key === "actualSales") return s.row.actualSales === "" || s.row.actualSales === undefined ? null : Number(s.row.actualSales);
   if (key === "buyAction") return s.buyAction;
+  // Buy Plan can't be read off a single month - it floors and carries across the
+  // row - so it is resolved by buyPlanForTypes, never here.
+  if (key === "buyPlan") return null;
   return s[key];
 }
 
@@ -339,19 +345,26 @@ function OTBEngine() {
     // WOS Target EOM $ at month t = sum of forecasted COGS across the next `wos` weeks,
     // starting at month t, prorating the final partial month. Runs out of data (and
     // understates the target) within `wos` weeks of the end of the visible 12 months.
+    // Returns the target and how many weeks of forecast data it actually found.
+    // Near the end of the visible 12 months the window runs out of future months,
+    // so weeksFound < wos and the target (and any buy derived from it) is
+    // understated by construction - the caller flags those months rather than
+    // letting a structurally low number read as "nothing to buy."
     function wosTargetAt(t) {
-      let weeksLeft = wos, total = 0, idx = t;
+      let weeksLeft = wos, total = 0, idx = t, weeksFound = 0;
       while (weeksLeft > 0 && idx < forecasts.length) {
         const take = Math.min(weeksLeft, WEEKS_PER_MONTH);
         total += forecasts[idx].forecastCOGS * (take / WEEKS_PER_MONTH);
         weeksLeft -= take;
+        weeksFound += take;
         idx++;
       }
-      return total;
+      return { total, weeksFound };
     }
 
     let actualBOMChain = start;
     let prevTargetEOM = null;
+    let prevWosTarget = null;
     const out = [];
     months.forEach((mKey, t) => {
       const row = getRow(type, mKey);
@@ -369,13 +382,36 @@ function OTBEngine() {
       else { basis = prevTargetEOM; basisSource = "target (rolled)"; }
 
       const targetEOM = basis + expected - forecastCOGS;
-      const wosTargetEOM = wosTargetAt(t);
+      const wos_ = wosTargetAt(t);
+      const wosTargetEOM = wos_.total;
+      const wosShort = wos_.weeksFound < wos - 0.01;
       const overUnder = wosTargetEOM - targetEOM;
       const buyAction = overUnder > 0 ? "Buy" : overUnder < 0 ? "Don't Buy" : "On Target";
 
-      out.push({ mKey, row, forecastSales, forecastCOGS, expected, basis, basisSource, targetEOM, wosTargetEOM, overUnder, buyAction });
+      // --- Buy Plan -------------------------------------------------------
+      // Over/Under is a CUMULATIVE gap: the roll-forward chain above never adds
+      // back any recommended buy, so it answers "how far short will I be at EOM
+      // if I order nothing from here." That is not the number you write a cheque
+      // for at market. Buy Plan is the incremental one: assume you bought to the
+      // cover target in every prior month, then ask what this month needs.
+      //
+      // Held UNFLOORED here on purpose. A group must be able to net a type that
+      // is over against one that is short before anything is called a buy - the
+      // same reason the headline totals net inside a group. Flooring happens once,
+      // at the aggregate, in buyPlanForTypes.
+      //
+      // A BOM override is an explicit statement about planned inventory (e.g. a
+      // deliberate sell-down glide path), so it re-anchors the plan chain; every
+      // other month starts from the previous month's cover target, which is where
+      // buying to plan would have left it.
+      const isOverride = basisSource === "target override" || basisSource === "actual override";
+      const planBOMPrev = t === 0 || isOverride ? basis : prevWosTarget;
+      const buyRaw = wosTargetEOM - (planBOMPrev + expected - forecastCOGS);
+
+      out.push({ mKey, row, forecastSales, forecastCOGS, expected, basis, basisSource, targetEOM, wosTargetEOM, wosShort, overUnder, buyAction, buyRaw });
       actualBOMChain = actualBOMForThisMonth - num(row.actualCogs) + num(row.received);
       prevTargetEOM = targetEOM;
+      prevWosTarget = wosTargetEOM;
     });
     return out;
   }
@@ -403,6 +439,67 @@ function OTBEngine() {
   // needed buy inside the same group before we floor at zero.
   function groupOverUnderAt(types, monthIdx) {
     return types.reduce((sum, t) => sum + seriesByType[t][monthIdx].overUnder, 0);
+  }
+
+  // Buy Plan for a set of types, across all 12 months.
+  //
+  // Two things have to happen in this order, and the order is the whole trick:
+  //   1. SUM the unfloored per-type buys, so an over-bought type nets against a
+  //      short one inside the same group. Flooring per type first would re-inflate
+  //      the buy exactly the way the old Math.max(overUnder,0) per type did.
+  //   2. THEN floor at zero month by month, carrying any surplus forward. The
+  //      carry matters: receipts landing in one month that overshoot its target
+  //      are real inventory that reduces the NEXT month's cheque. Flooring without
+  //      carrying would bill the following month in full and overstate the season.
+  const buyPlanCache = useMemo(() => new Map(), [seriesByType]);
+  function buyPlanForTypes(types) {
+    const key = types.join("|");
+    const hit = buyPlanCache.get(key);
+    if (hit) return hit;
+    const out = [];
+    let carry = 0;
+    for (let t = 0; t < months.length; t++) {
+      const avail = types.reduce((sum, ty) => sum + seriesByType[ty][t].buyRaw, 0) + carry;
+      out.push(Math.max(0, avail));
+      carry = Math.min(0, avail);
+    }
+    buyPlanCache.set(key, out);
+    return out;
+  }
+  // A month is flagged when its cover window ran past the end of the 12-month
+  // horizon for any member type, so its buy is understated by construction.
+  function buyPlanShortAt(types, monthIdx) {
+    return types.some((t) => seriesByType[t][monthIdx].wosShort);
+  }
+  // Total across the months currently on screen - the market budget.
+  function buyPlanWindowTotal(types) {
+    return buyPlanForTypes(types).slice(scrollStart, scrollStart + visibleMonths).reduce((a, b) => a + b, 0);
+  }
+  // The TOTAL row must not net across the rows above it. Netting is only ever
+  // legitimate inside one planning bucket - a shopper substitutes a tee for a
+  // blouse, she does not substitute boots for a tee - so pooling all 61 types
+  // into one set would let footwear overstock silently fund a tops buy and
+  // report a budget well below the sum of what you actually have to write.
+  // Instead the total re-buckets by whatever the grid is currently showing, so
+  // TOTAL always equals the sum of the visible rows.
+  function buyPlanRowSets(types) {
+    if (viewMode === "group") {
+      const m = {};
+      types.forEach((t) => { const g = planGroups[t] || t; (m[g] = m[g] || []).push(t); });
+      return Object.values(m);
+    }
+    if (viewMode === "category") {
+      const m = {};
+      types.forEach((t) => { const c = CATEGORY_OF[t] || t; (m[c] = m[c] || []).push(t); });
+      return Object.values(m);
+    }
+    return types.map((t) => [t]);
+  }
+  function buyPlanTotalAt(types, monthIdx) {
+    return buyPlanRowSets(types).reduce((sum, set) => sum + buyPlanForTypes(set)[monthIdx], 0);
+  }
+  function buyPlanTotalWindow(types) {
+    return buyPlanRowSets(types).reduce((sum, set) => sum + buyPlanWindowTotal(set), 0);
   }
 
   // Month Pace: for the current real-world month (months[0]), compares actual sales/COGS-to-date
@@ -1028,9 +1125,26 @@ function OTBEngine() {
   }
 
   const visibleMonthKeys = months.slice(scrollStart, scrollStart + visibleMonths);
+  // Buy Plan gets an extra right-hand column: the total across the months on
+  // screen, i.e. the cheque you can take to market for that row.
+  const showBuyTotal = metric === "buyPlan";
+  const detailColSpan = visibleMonths + 3 + (showBuyTotal ? 1 : 0);
+  // Renders one Buy Plan cell, greying and daggering months whose cover window
+  // ran off the end of the horizon (structurally understated, not a real zero).
+  function buyPlanCell(types, colIdx, v, weight) {
+    const short = buyPlanShortAt(types, scrollStart + colIdx);
+    return (
+      <td key={colIdx} className="text-right py-2 px-3" style={{ color: short ? "#B0B4BC" : v > 0 ? "#20232B" : "#8B8F98", fontWeight: weight }}>
+        {money(v)}{short ? <span style={{ color: "#C99A3C" }}> †</span> : null}
+      </td>
+    );
+  }
   function sumMetricForTypes(types, colIdx) {
     if (metric === "buyAction") return null;
     const monthIdx = scrollStart + colIdx;
+    // Buy Plan nets and floors across the whole set at once - it is not a sum of
+    // per-type values, so it can't go through metricValue.
+    if (metric === "buyPlan") return buyPlanForTypes(types)[monthIdx];
     return types.reduce((sum, t) => sum + (Number(metricValue(seriesByType[t][monthIdx], metric)) || 0), 0);
   }
   const filteredCategories = [...new Set(filteredTaxonomy.map(([, cat]) => cat))];
@@ -1262,6 +1376,9 @@ function OTBEngine() {
                   {visibleMonthKeys.map((m) => (
                     <th key={m} style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", color: "#EDE7DA", minWidth: 105 }} className="text-right py-2 px-3">{monthLabel(m)}</th>
                   ))}
+                  {showBuyTotal && (
+                    <th style={{ position: "sticky", top: 0, zIndex: 3, background: "#C99A3C", color: "#20232B", minWidth: 120 }} className="text-right py-2 px-3">TO BUY</th>
+                  )}
                   <th style={{ position: "sticky", top: 0, zIndex: 3, background: "#2A303B", minWidth: 32 }}></th>
                 </tr>
               </thead>
@@ -1281,9 +1398,11 @@ function OTBEngine() {
                         {visibleMonthKeys.map((m, i) => {
                           const v = sumMetricForTypes(typesInCat, i);
                           if (v === null) return <td key={i} className="text-right py-2 px-3" style={{ color: "#B0B4BC" }}>—</td>;
+                          if (showBuyTotal) return buyPlanCell(typesInCat, i, v, 600);
                           const cellColor = metric === "overUnder" ? (v > 0 ? "#5B7A5B" : v < 0 ? "#B5432D" : "#20232B") : (v < 0 ? "#B5432D" : "#20232B");
                           return <td key={i} className="text-right py-2 px-3" style={{ color: cellColor, fontWeight: 600 }}>{money(v)}</td>;
                         })}
+                        {showBuyTotal && <td className="text-right py-2 px-3" style={{ background: "#FBF3E2", color: "#20232B", fontWeight: 700 }}>{money(buyPlanWindowTotal(typesInCat))}</td>}
                         <td></td>
                       </tr>
                     );
@@ -1305,33 +1424,41 @@ function OTBEngine() {
                           {visibleMonthKeys.map((m, i) => {
                             const v = sumMetricForTypes(gtypes, i);
                             if (v === null) return <td key={i} className="text-right py-2 px-3" style={{ color: "#B0B4BC" }}>—</td>;
+                            if (showBuyTotal) return buyPlanCell(gtypes, i, v, 700);
                             const cellColor = metric === "overUnder" ? (v > 0 ? "#5B7A5B" : v < 0 ? "#B5432D" : "#20232B") : (v < 0 ? "#B5432D" : "#20232B");
                             return <td key={i} className="text-right py-2 px-3" style={{ color: cellColor, fontWeight: 700 }}>{money(v)}</td>;
                           })}
+                          {showBuyTotal && <td className="text-right py-2 px-3" style={{ background: "#FBF3E2", color: "#20232B", fontWeight: 700 }}>{money(buyPlanWindowTotal(gtypes))}</td>}
                           <td className="text-center py-2">{gOpen ? <Icon.chevronUp /> : <Icon.chevronDown />}</td>
                         </tr>
                         {gOpen && gtypes.map((type) => {
                           const series = seriesByType[type];
                           const tOpen = expandedType === type;
+                          // Member rows show that type's own plan in isolation, so they
+                          // will not add up to the netted group row above - that is the
+                          // point of the group, not a rounding error.
+                          const bp = showBuyTotal ? buyPlanForTypes([type]) : null;
                           return (
                             <Fragment key={type}>
                               <tr className="cursor-pointer" onClick={() => setExpandedType(tOpen ? null : type)} style={{ background: "#FAF8F3", borderTop: "1px solid #EDE9DE" }}>
                                 <td style={{ position: "sticky", left: 0, zIndex: 2, background: "#FAF8F3" }} className="py-1.5 px-3"></td>
                                 <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#FAF8F3", color: "#5C6270" }} className="py-1.5 px-3 pl-6">{type}</td>
                                 {series.slice(scrollStart, scrollStart + visibleMonths).map((s, i) => {
-                                  const v = metricValue(s, metric);
+                                  const v = showBuyTotal ? bp[scrollStart + i] : metricValue(s, metric);
                                   if (metric === "buyAction") {
                                     const actionColor = v === "Buy" ? "#5B7A5B" : v === "Don't Buy" ? "#B5432D" : "#8C6E4A";
                                     return <td key={i} className="text-right py-1.5 px-3"><span className="px-2 py-0.5 rounded-full text-[10px]" style={{ background: `${actionColor}22`, color: actionColor, fontWeight: 700 }}>{v}</span></td>;
                                   }
+                                  if (showBuyTotal) return buyPlanCell([type], i, v, 400);
                                   const cellColor = metric === "overUnder" ? (v > 0 ? "#5B7A5B" : v < 0 ? "#B5432D" : "#20232B") : (v < 0 ? "#B5432D" : "#20232B");
                                   return <td key={i} className="text-right py-1.5 px-3" style={{ color: cellColor }}>{money(v)}</td>;
                                 })}
+                                {showBuyTotal && <td className="text-right py-1.5 px-3" style={{ background: "#FBF3E2", color: "#5C6270" }}>{money(buyPlanWindowTotal([type]))}</td>}
                                 <td className="text-center py-1.5">{tOpen ? <Icon.chevronUp /> : <Icon.chevronDown />}</td>
                               </tr>
                               {tOpen && (
                                 <tr>
-                                  <td colSpan={visibleMonths + 3} style={{ background: "#FAF8F3", position: "sticky", left: 0 }} className="p-3">
+                                  <td colSpan={detailColSpan} style={{ background: "#FAF8F3", position: "sticky", left: 0 }} className="p-3">
                                     <div style={{ width: "min(90vw, 900px)" }}>
                                       <TypeDetail
                                         type={type} months={months} series={series}
@@ -1356,6 +1483,7 @@ function OTBEngine() {
                   const series = seriesByType[type];
                   const isOpen = expandedType === type;
                   const rowBg = isOpen ? "#FAF8F3" : "#FFFFFF";
+                  const bp = showBuyTotal ? buyPlanForTypes([type]) : null;
                   return (
                     <Fragment key={type}>
                       <tr className="cursor-pointer" onClick={() => setExpandedType(isOpen ? null : type)} style={{ borderTop: "1px solid #EDE9DE" }}>
@@ -1367,19 +1495,21 @@ function OTBEngine() {
                         </td>
                         <td style={{ position: "sticky", left: CATW, zIndex: 2, background: rowBg, color: "#20232B", fontWeight: 500 }} className="py-2 px-3">{type}</td>
                         {series.slice(scrollStart, scrollStart + visibleMonths).map((s, i) => {
-                          const v = metricValue(s, metric);
+                          const v = showBuyTotal ? bp[scrollStart + i] : metricValue(s, metric);
                           if (metric === "buyAction") {
                             const actionColor = v === "Buy" ? "#5B7A5B" : v === "Don't Buy" ? "#B5432D" : "#8C6E4A";
                             return <td key={i} className="text-right py-2 px-3"><span className="px-2 py-0.5 rounded-full text-[10px]" style={{ background: `${actionColor}22`, color: actionColor, fontWeight: 700 }}>{v}</span></td>;
                           }
+                          if (showBuyTotal) return buyPlanCell([type], i, v, 500);
                           const cellColor = metric === "overUnder" ? (v > 0 ? "#5B7A5B" : v < 0 ? "#B5432D" : "#20232B") : (v < 0 ? "#B5432D" : "#20232B");
                           return <td key={i} className="text-right py-2 px-3" style={{ color: cellColor, fontWeight: metric === "overUnder" ? 600 : 400 }}>{money(v)}</td>;
                         })}
+                        {showBuyTotal && <td className="text-right py-2 px-3" style={{ background: "#FBF3E2", color: "#20232B", fontWeight: 600 }}>{money(buyPlanWindowTotal([type]))}</td>}
                         <td className="text-center py-2">{isOpen ? <Icon.chevronUp /> : <Icon.chevronDown />}</td>
                       </tr>
                       {isOpen && (
                         <tr>
-                          <td colSpan={visibleMonths + 3} style={{ background: "#FAF8F3", position: "sticky", left: 0 }} className="p-3">
+                          <td colSpan={detailColSpan} style={{ background: "#FAF8F3", position: "sticky", left: 0 }} className="p-3">
                             <div style={{ width: "min(90vw, 900px)" }}>
                               <TypeDetail
                                 type={type} months={months} series={series}
@@ -1403,11 +1533,13 @@ function OTBEngine() {
                   <td style={{ position: "sticky", left: CATW, zIndex: 2, background: "#F1EEE6", color: "#20232B", fontWeight: 700 }} className="py-2 px-3">TOTAL ({filteredTaxonomy.length} types)</td>
                   {visibleMonthKeys.map((m, i) => {
                     const allTypes = filteredTaxonomy.map(([t]) => t);
+                    if (showBuyTotal) return buyPlanCell(allTypes, i, buyPlanTotalAt(allTypes, scrollStart + i), 700);
                     const v = sumMetricForTypes(allTypes, i);
                     if (v === null) return <td key={i} className="text-right py-2 px-3" style={{ color: "#B0B4BC" }}>—</td>;
                     const cellColor = metric === "overUnder" ? (v > 0 ? "#5B7A5B" : v < 0 ? "#B5432D" : "#20232B") : (v < 0 ? "#B5432D" : "#20232B");
                     return <td key={i} className="text-right py-2 px-3" style={{ color: cellColor, fontWeight: 700 }}>{money(v)}</td>;
                   })}
+                  {showBuyTotal && <td className="text-right py-2 px-3" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 700 }}>{money(buyPlanTotalWindow(filteredTaxonomy.map(([t]) => t)))}</td>}
                   <td></td>
                 </tr>
               </tbody>
@@ -1415,6 +1547,14 @@ function OTBEngine() {
           </div>
         </div>
 
+        {showBuyTotal && (
+          <div className="mt-4 flex items-start gap-2 text-xs" style={{ color: "#8B8F98" }}>
+            <Icon.info />
+            <span>
+              <b style={{ color: "#20232B" }}>Buy Plan $</b> is what you write <i>this month</i>, at cost, assuming you bought to the cover target in every earlier month - not the cumulative gap Over/Under shows. Receipts already on order are netted out first, so a month reads $0 when what's landing already covers it, and any surplus carries forward to reduce the next month. Inside a planning group an overstocked type nets against a short one before anything is called a buy, so member rows will not sum to the group row. <b style={{ color: "#20232B" }}>TO BUY</b> totals the months currently on screen - scroll the window to match your market dates. Months marked <span style={{ color: "#C99A3C" }}>†</span> sit near the end of the 12-month horizon, where the forward cover window runs out of forecast data: those buys are understated by construction, not genuinely small.
+            </span>
+          </div>
+        )}
         <div className="mt-4 flex items-start gap-2 text-xs" style={{ color: "#8B8F98" }}>
           <Icon.info />
           <span>
