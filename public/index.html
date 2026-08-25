@@ -243,13 +243,9 @@ function OTBEngine() {
   const [showMonthPace, setShowMonthPace] = useState(false);
   // --- Buy Board -------------------------------------------------------------
   const [showBuyBoard, setShowBuyBoard] = useState(false);
-  const [showLeadTimes, setShowLeadTimes] = useState(false);
   const [buyView, setBuyView] = useState("month"); // "month" = one month in detail, "season" = all 12
   const [useTrend, setUseTrend] = useState(true);
   const [coverOverride, setCoverOverride] = useState("");   // blank = derive from lead time
-  const [leadWeeks, setLeadWeeks] = useState({});           // planning group -> weeks (fallback)
-  const [vendorLeadWeeks, setVendorLeadWeeks] = useState({}); // vendor -> weeks (preferred)
-  const [vendorTypes, setVendorTypes] = useState({});       // vendor -> [product types], captured on vendor load
   const [expandedPaceCat, setExpandedPaceCat] = useState(null);
   const [dailySales, setDailySales] = useState({}); // { "YYYY-MM-DD": netSalesAmount } - imported via CSV, since Shopify's live Admin API only reaches back ~60 days, too short to pull LY comparisons directly.
   const [liveInventory, setLiveInventory] = useState(null); // { totals: {type: {units, value}}, loadedAt } - snapshot for Month Pace's Weeks of Stock column, loaded via CSV import (see "Import current stock" - a live per-variant API pull was tried first but proved too slow/unreliable for a large multi-location catalog).
@@ -285,9 +281,6 @@ function OTBEngine() {
           setDailySales(parsed.dailySales || {});
           setPlanGroups(parsed.planGroups && Object.keys(parsed.planGroups).length ? parsed.planGroups : defaultPlanGroups());
           if (parsed.liveInventory) setLiveInventory({ ...parsed.liveInventory, loadedAt: parsed.liveInventory.loadedAt ? new Date(parsed.liveInventory.loadedAt) : new Date() });
-          if (parsed.leadWeeks) setLeadWeeks(parsed.leadWeeks);
-          if (parsed.vendorLeadWeeks) setVendorLeadWeeks(parsed.vendorLeadWeeks);
-          if (parsed.vendorTypes) setVendorTypes(parsed.vendorTypes);
           if (parsed.coverOverride !== undefined) setCoverOverride(parsed.coverOverride);
           if (parsed.useTrend !== undefined) setUseTrend(parsed.useTrend);
           loadedFromServer = true;
@@ -306,9 +299,6 @@ function OTBEngine() {
             setDailySales(parsed.dailySales || {});
             setPlanGroups(parsed.planGroups && Object.keys(parsed.planGroups).length ? parsed.planGroups : defaultPlanGroups());
             if (parsed.liveInventory) setLiveInventory({ ...parsed.liveInventory, loadedAt: parsed.liveInventory.loadedAt ? new Date(parsed.liveInventory.loadedAt) : new Date() });
-            if (parsed.leadWeeks) setLeadWeeks(parsed.leadWeeks);
-            if (parsed.vendorLeadWeeks) setVendorLeadWeeks(parsed.vendorLeadWeeks);
-            if (parsed.vendorTypes) setVendorTypes(parsed.vendorTypes);
             if (parsed.coverOverride !== undefined) setCoverOverride(parsed.coverOverride);
             if (parsed.useTrend !== undefined) setUseTrend(parsed.useTrend);
           }
@@ -322,7 +312,7 @@ function OTBEngine() {
     if (!loaded) return;
     setSaveState("saving");
     const t = setTimeout(async () => {
-      const payload = { assumptions, startingBOM, data, dailySales, planGroups, liveInventory, leadWeeks, vendorLeadWeeks, vendorTypes, coverOverride, useTrend };
+      const payload = { assumptions, startingBOM, data, dailySales, planGroups, liveInventory, coverOverride, useTrend };
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payload)); // always keep a local backup copy too
       } catch (e) { /* ignore quota errors */ }
@@ -332,7 +322,7 @@ function OTBEngine() {
       } catch (e) { setSaveState("saved locally only"); }
     }, 400);
     return () => clearTimeout(t);
-  }, [assumptions, startingBOM, data, dailySales, planGroups, liveInventory, leadWeeks, vendorLeadWeeks, vendorTypes, coverOverride, useTrend, loaded]);
+  }, [assumptions, startingBOM, data, dailySales, planGroups, liveInventory, coverOverride, useTrend, loaded]);
 
   function getAssumptions(cat) { return assumptions[cat] || defaultAssumptions(); }
   function setAssumption(cat, patch) { setAssumptions((prev) => ({ ...prev, [cat]: { ...getAssumptions(cat), ...patch } })); }
@@ -549,8 +539,6 @@ function OTBEngine() {
   //      lead time + how often you re-plan + a safety buffer. A 4-week tee vendor
   //      needs ~10 weeks of cover; a 12-week dress vendor needs ~18. One flat number
   //      across every category is wrong in both directions at once.
-  const REVIEW_WEEKS = 4.33;  // you re-plan monthly, so a buy must survive to the next one
-  const SAFETY_WEEKS = 1.5;   // buffer for forecast error
   const TREND_DECAY = 0.7;    // how fast the current month's read stops applying to later months
 
   const buyBoard = useMemo(() => {
@@ -588,27 +576,17 @@ function OTBEngine() {
     // nothing to do with selling (see TREND_DECAY below).
     const storeTrend = storeExp > 250 ? storeAct / storeExp : null;
 
-    // A group's lead time is its SLOWEST supplier - the group is not shoppable until
-    // the last piece lands. Vendor-level wins when set (that mapping comes from the
-    // vendor report); otherwise a per-group figure; otherwise a conservative default.
-    function leadForGroup(g) {
-      const types = typesByGroup[g] || [];
-      const hits = [];
-      Object.entries(vendorLeadWeeks).forEach(([v, w]) => {
-        const wk = num(w);
-        if (!wk) return;
-        if ((vendorTypes[v] || []).some((t) => types.includes(t))) hits.push(wk);
-      });
-      if (hits.length) return { weeks: Math.max.apply(null, hits), source: "vendor" };
-      const gw = num(leadWeeks[g]);
-      if (gw) return { weeks: gw, source: "group" };
-      return { weeks: 6, source: "default" };
-    }
+    // Cover weeks: the group takes its own category's WOS setting from the
+    // Assumptions panel, unless the on-screen box overrides it. There is no
+    // lead-time model here on purpose - how fast a vendor ships is something the
+    // buyer knows and the software would only get wrong. This screen answers one
+    // question: how much am I short for this month.
     function coverForGroup(g) {
       const ov = num(coverOverride);
-      const lead = leadForGroup(g);
-      if (ov) return { weeks: ov, source: "override", lead: lead.weeks, leadSource: lead.source };
-      return { weeks: Math.round((lead.weeks + REVIEW_WEEKS + SAFETY_WEEKS) * 10) / 10, source: "derived", lead: lead.weeks, leadSource: lead.source };
+      if (ov) return { weeks: ov, source: "override" };
+      const types = typesByGroup[g] || [];
+      const w = types.length ? getAssumptions(CATEGORY_OF[types[0]]).wosTarget : 12;
+      return { weeks: w, source: "assumptions" };
     }
 
     // Same floor-and-carry plan as the grid metric, but on the group's aggregate with
@@ -646,59 +624,43 @@ function OTBEngine() {
       return months.map((m, t) => {
         const w = wosAt(t);
         const before = bom + onOrder[t] - fc[t];
-        const buy = Math.max(0, w.tot - before);
+        // net is the honest position: positive = short by this much, negative = over
+        // by this much. buy is net floored at zero, because you cannot un-buy stock.
+        // Rolling `bom` on the floored buy is what carries a surplus into next month.
+        const net = w.tot - before;
+        const buy = Math.max(0, net);
         bom = before + buy;
-        return { m, buy, cogs: fc[t], onOrder: onOrder[t], target: w.tot, short: w.wrapped };
+        return { m, net, buy, cogs: fc[t], onOrder: onOrder[t], target: w.tot, short: w.wrapped };
       });
     }
 
     const idx = monthCursor;
-    const [my, mm] = months[idx].split("-").map(Number);
-    const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
-
     const rows = groupNames.map((g) => {
       const types = typesByGroup[g] || [];
       const cover = coverForGroup(g);
       const full = seriesForGroup(types, cover.weeks, useTrend);
       const s = full[idx];
       const rawRow = seriesForGroup(types, cover.weeks, false)[idx];
-      // Order-by for every month, so the season view can grey out the months this
-      // group can no longer be received in.
-      const reachableByMonth = months.map((mk) => {
-        const [ry, rm] = mk.split("-").map(Number);
-        const d = new Date(ry, rm - 1, 1);
-        d.setDate(d.getDate() - Math.round(cover.lead * 7));
-        return d >= midnight;
-      });
       const cats = [...new Set(types.map((t) => CATEGORY_OF[t]))];
       const tvals = cats.map((c) => trendByCat[c]).filter((x) => x != null);
       const trend = tvals.length ? tvals.reduce((a, b) => a + b, 0) / tvals.length : null;
-      const orderBy = new Date(my, mm - 1, 1);
-      orderBy.setDate(orderBy.getDate() - Math.round(cover.lead * 7));
       const sens = [6, 8, 10, 12].map((w) => ({ w, buy: seriesForGroup(types, w, useTrend)[idx].buy }));
-      // If this month can no longer be received, say which one still can, instead of
-      // reporting a date in the past that the buyer can do nothing with.
-      let earliest = null;
-      for (let k = 0; k < months.length; k++) {
-        const [ey, em] = months[k].split("-").map(Number);
-        const d = new Date(ey, em - 1, 1);
-        d.setDate(d.getDate() - Math.round(cover.lead * 7));
-        if (d >= midnight) { earliest = months[k]; break; }
-      }
-      return { g, types, cover, trend, buy: s.buy, rawBuy: rawRow.buy, cogs: s.cogs, onOrder: s.onOrder, target: s.target, short: s.short, orderBy, reachable: orderBy >= midnight, earliest, sens,
-               allBuys: full.map((x) => x.buy), allShort: full.map((x) => x.short), reachableByMonth };
+      return { g, types, cover, trend, buy: s.buy, net: s.net, rawBuy: rawRow.buy, cogs: s.cogs, onOrder: s.onOrder,
+               target: s.target, short: s.short, sens,
+               allBuys: full.map((x) => x.buy), allNet: full.map((x) => x.net), allShort: full.map((x) => x.short) };
     }).filter((r) => r.types.length);
 
     return {
       rows,
       total: rows.reduce((a, r) => a + r.buy, 0),
+      over: rows.reduce((a, r) => a + Math.min(0, r.net), 0),
       rawTotal: rows.reduce((a, r) => a + r.rawBuy, 0),
       mStr: months[idx],
       isPast: idx === 0 && isCur,
       paceRatio, weekdayMatched: dp.complete, daysElapsed, totalDays, storeTrend,
       anyTrend: Object.values(trendByCat).some((x) => x != null),
     };
-  }, [data, assumptions, startingBOM, months, planGroups, groupNames, typesByGroup, leadWeeks, vendorLeadWeeks, vendorTypes, coverOverride, useTrend, monthCursor, dailySales]);
+  }, [data, assumptions, startingBOM, months, planGroups, groupNames, typesByGroup, coverOverride, useTrend, monthCursor, dailySales]);
 
   // Month Pace: for the current real-world month (months[0]), compares actual sales/COGS-to-date
   // against where we'd expect to be given the forecast and how far through the calendar month we are.
@@ -1208,7 +1170,6 @@ function OTBEngine() {
       }));
       const typeToCat = Object.fromEntries(TAXONOMY);
       const vendorSet = new Set();
-      const vTypes = {};
       results.forEach((res) => { if (!res.error) Object.keys(res.vendors || {}).forEach((v) => vendorSet.add(v)); });
       const table = {};
       vendorSet.forEach((v) => { table[v] = {}; });
@@ -1220,12 +1181,7 @@ function OTBEngine() {
         Object.entries(res.vendors || {}).forEach(([vendor, v]) => {
           const actualMarginPct = v.sales > 0 ? ((v.sales - v.cogs) / v.sales) * 100 : null;
           let weightedGM = 0, weightTotal = 0;
-          // Remember which product types this vendor actually ships. The vendor report is
-          // the only place that mapping exists, and the Buy Board needs it to turn a
-          // per-vendor lead time into a per-group one.
-          vTypes[vendor] = vTypes[vendor] || new Set();
-          Object.keys(v.byType).forEach((ty) => vTypes[vendor].add(ty));
-          Object.entries(v.byType).forEach(([type, t]) => {
+    Object.entries(v.byType).forEach(([type, t]) => {
             const cat = typeToCat[type];
             const gm = getAssumptions(cat).gmPct;
             weightedGM += gm * t.sales;
@@ -1240,7 +1196,6 @@ function OTBEngine() {
       });
       setVendorMonths(mStrs);
       setVendorTable(table);
-      setVendorTypes(Object.fromEntries(Object.entries(vTypes).map(([v2, set]) => [v2, [...set]])));
       setVendorStatus(`Loaded ${vendorSet.size} vendors across ${mStrs.length} months.${anyTruncated ? " (large order history in at least one month - some data may be missing)" : ""}`);
     } catch (e) {
       setVendorStatus("Failed to load: " + e.message);
@@ -1454,13 +1409,18 @@ function OTBEngine() {
             <div style={{ color: "#6C727E" }} className="text-[11px] mt-1">change with the month arrows above</div>
           </div>
           <div>
-            <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">Total to buy — at cost</div>
-            <div style={{ fontFamily: "'Roboto Slab', serif", color: "#C99A3C" }} className="text-3xl font-bold">{money(buyBoard.total)}</div>
+            <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">To buy — at cost</div>
+            <div style={{ fontFamily: "'Roboto Slab', serif", color: "#7FA87F" }} className="text-3xl font-bold">{money(buyBoard.total)}</div>
             {useTrend && buyBoard.anyTrend && (
               <div style={{ color: "#6C727E" }} className="text-[11px] mt-1">
                 {money(buyBoard.rawTotal)} on last year × growth, before the trend adjustment
               </div>
             )}
+          </div>
+          <div>
+            <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">Overbought — at cost</div>
+            <div style={{ fontFamily: "'Roboto Slab', serif", color: "#E0806B" }} className="text-3xl font-bold">{money(buyBoard.over)}</div>
+            <div style={{ color: "#6C727E" }} className="text-[11px] mt-1">groups already past their cover target</div>
           </div>
           <div>
             <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">Season is running</div>
@@ -1490,9 +1450,6 @@ function OTBEngine() {
               <button onClick={() => setCoverOverride("")} className="text-[11px] underline" style={{ color: "#8C6E4A" }}>use derived</button>
             )}
           </label>
-          <button onClick={() => setShowLeadTimes(true)} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5" style={{ background: "#20232B", color: "#F1EEE6" }}>
-            <Icon.sliders /> Lead times
-          </button>
           <div className="flex rounded overflow-hidden" style={{ border: "1px solid #DCD5C4" }}>
             {[["month", "This month"], ["season", "All 12 months"]].map(([k, lbl]) => (
               <button key={k} onClick={() => setBuyView(k)} className="text-xs px-3 py-1.5"
@@ -1520,22 +1477,19 @@ function OTBEngine() {
                 {buyBoard.rows.map((r) => (
                   <tr key={r.g} style={{ borderTop: "1px solid #EDE9DE" }}>
                     <td className="py-2 px-3" style={{ position: "sticky", left: 0, zIndex: 1, background: "#FFFFFF", fontWeight: 700, color: "#20232B" }}>
-                      {r.g} <span style={{ color: "#8B8F98", fontWeight: 400 }}>({r.cover.lead}w lead)</span>
+                      {r.g} <span style={{ color: "#8B8F98", fontWeight: 400 }}>({r.cover.weeks}w cover)</span>
                     </td>
-                    {r.allBuys.map((b, i) => {
-                      const dead = !r.reachableByMonth[i];
-                      return (
-                        <td key={i} className="text-right py-2 px-3" title={dead ? "Order-by date has passed - this month can no longer be received" : ""}
-                          style={{
-                            color: dead ? "#C9CCD2" : b > 0 ? "#20232B" : "#B0B4BC",
-                            background: i === monthCursor ? "#FBF3E2" : "transparent",
-                            fontWeight: b > 0 && !dead ? 600 : 400,
-                          }}>
-                          {money(b)}{r.allShort[i] ? <span style={{ color: "#C99A3C" }}> †</span> : null}
-                        </td>
-                      );
-                    })}
-                    <td className="text-right py-2 px-3" style={{ background: "#FBF3E2", fontWeight: 700, color: "#20232B" }}>
+                    {r.allNet.map((n, i) => (
+                      <td key={i} className="text-right py-2 px-3"
+                        style={{
+                          color: n > 0 ? "#3F7A3F" : n < 0 ? "#B5432D" : "#B0B4BC",
+                          background: i === monthCursor ? "#FBF3E2" : n > 0 ? "#F4F8F3" : "transparent",
+                          fontWeight: n > 0 ? 600 : 400,
+                        }}>
+                        {money(n)}{r.allShort[i] ? <span style={{ color: "#C99A3C" }}> †</span> : null}
+                      </td>
+                    ))}
+                    <td className="text-right py-2 px-3" style={{ background: "#FBF3E2", fontWeight: 700, color: "#3F7A3F" }}>
                       {money(r.allBuys.reduce((a, b) => a + b, 0))}
                     </td>
                   </tr>
@@ -1544,7 +1498,10 @@ function OTBEngine() {
                   <td className="py-2 px-3" style={{ position: "sticky", left: 0, zIndex: 1, background: "#F1EEE6", fontWeight: 700 }}>TOTAL</td>
                   {months.map((m, i) => (
                     <td key={i} className="text-right py-2 px-3" style={{ fontWeight: 700, background: i === monthCursor ? "#FBF3E2" : "transparent" }}>
-                      {money(buyBoard.rows.reduce((a, r) => a + r.allBuys[i], 0))}
+                      <div style={{ color: "#3F7A3F" }}>{money(buyBoard.rows.reduce((a, r) => a + r.allBuys[i], 0))}</div>
+                      <div style={{ color: "#B5432D", fontWeight: 400, fontSize: 11 }}>
+                        {money(buyBoard.rows.reduce((a, r) => a + Math.min(0, r.allNet[i]), 0))}
+                      </div>
                     </td>
                   ))}
                   <td className="text-right py-2 px-3" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 700 }}>
@@ -1562,11 +1519,9 @@ function OTBEngine() {
               <tr style={{ background: "#20232B", color: "#EDE7DA" }}>
                 <th className="text-left py-2 px-3">Planning group</th>
                 <th className="text-right py-2 px-3">Selling vs plan</th>
-                <th className="text-right py-2 px-3">Lead</th>
                 <th className="text-right py-2 px-3">Cover</th>
                 <th className="text-right py-2 px-3">Already coming</th>
-                <th className="text-right py-2 px-3" style={{ background: "#C99A3C", color: "#20232B" }}>BUY</th>
-                <th className="text-left py-2 px-3">Order by</th>
+                <th className="text-right py-2 px-3" style={{ background: "#C99A3C", color: "#20232B" }}>BUY / OVER</th>
               </tr>
             </thead>
             <tbody>
@@ -1576,26 +1531,18 @@ function OTBEngine() {
                   <td className="text-right py-2 px-3" style={{ color: r.trend == null ? "#B0B4BC" : r.trend < 0.95 ? "#B5432D" : r.trend > 1.05 ? "#5B7A5B" : "#5C6270" }}>
                     {r.trend == null ? "—" : `${r.trend >= 1 ? "+" : ""}${((r.trend - 1) * 100).toFixed(0)}%`}
                   </td>
-                  <td className="text-right py-2 px-3" style={{ color: r.cover.leadSource === "default" ? "#B0B4BC" : "#5C6270" }}>
-                    {r.cover.lead}w{r.cover.leadSource === "default" ? "*" : ""}
-                  </td>
-                  <td className="text-right py-2 px-3" style={{ color: "#5C6270" }}>{r.cover.weeks}w{r.cover.source === "override" ? "†" : ""}</td>
+                  <td className="text-right py-2 px-3" style={{ color: "#5C6270" }}>{r.cover.weeks}w{r.cover.source === "override" ? "*" : ""}</td>
                   <td className="text-right py-2 px-3" style={{ color: "#5C6270" }}>{money(r.onOrder)}</td>
-                  <td className="text-right py-2 px-3" style={{ fontWeight: 700, color: r.buy > 0 ? "#20232B" : "#B0B4BC", background: r.buy > 0 ? "#FBF3E2" : "transparent" }}>{money(r.buy)}</td>
-                  <td className="py-2 px-3" style={{ color: r.buy <= 0 ? "#B0B4BC" : r.reachable ? "#5B7A5B" : "#8C6E4A" }}>
-                    {r.buy <= 0 ? "—" : r.reachable
-                      ? r.orderBy.toLocaleDateString("en-US", { month: "short", day: "numeric" })
-                      : r.earliest
-                        ? `can't land — soonest is ${monthLabel(r.earliest)}`
-                        : "can't land in this horizon"}
-                  </td>
+                  <td className="text-right py-2 px-3" style={{ fontWeight: 700, color: r.net > 0 ? "#3F7A3F" : r.net < 0 ? "#B5432D" : "#B0B4BC", background: r.net > 0 ? "#EAF2E8" : r.net < 0 ? "#FBEDEA" : "transparent" }}>{money(r.net)}</td>
                 </tr>
               ))}
               <tr style={{ borderTop: "2px solid #20232B", background: "#F1EEE6" }}>
                 <td className="py-2 px-3" style={{ fontWeight: 700 }}>TOTAL</td>
-                <td colSpan={4}></td>
-                <td className="text-right py-2 px-3" style={{ fontWeight: 700, background: "#C99A3C", color: "#20232B" }}>{money(buyBoard.total)}</td>
-                <td></td>
+                <td colSpan={3}></td>
+                <td className="text-right py-2 px-3" style={{ fontWeight: 700, background: "#C99A3C", color: "#20232B" }}>
+                  <span style={{ color: "#20232B" }}>{money(buyBoard.total)}</span>
+                  <span style={{ color: "#7A2E1E", fontWeight: 400 }}> / {money(buyBoard.over)}</span>
+                </td>
               </tr>
             </tbody>
           </table>
@@ -1625,7 +1572,7 @@ function OTBEngine() {
         <div className="mt-4 flex items-start gap-2 text-xs" style={{ color: "#8B8F98" }}>
           <Icon.info />
           <span>
-            Every figure is <b style={{ color: "#20232B" }}>at cost</b>. <b style={{ color: "#20232B" }}>Cover</b> is derived as lead time + {REVIEW_WEEKS}w (you re-plan monthly) + {SAFETY_WEEKS}w safety, unless you override it — a 4-week vendor needs about 10 weeks of cover, a 12-week vendor about 18, which is why one flat number across every category is wrong in both directions. <b style={{ color: "#20232B" }}>Selling vs plan</b> compares this month's actuals-to-date against what the plan expected by now, measured per category and capped at ±40%; groups with no synced actuals show “—” and are left on last year × growth. The adjustment <b style={{ color: "#20232B" }}>fades with distance</b> ({Math.round(TREND_DECAY * 100)}% carried per month forward), because three weeks of one month says a lot about next month and almost nothing about next spring. Expect the buy to move by more than sales do: the cover target rises with the forecast at the same time as stock drains faster, so both sides of the gap widen together — a few points of selling can be a double-digit swing in dollars. In <b style={{ color: "#20232B" }}>All 12 months</b>, each row is that group's own buy schedule and the SEASON column totals it; months whose order-by date has already passed are greyed, so what's left in black is what you can still act on. <b style={{ color: "#20232B" }}>Order by</b> counts the lead time back from the first of the month — if it's already passed, the goods cannot land in time no matter what the dollars say. A lead marked <b style={{ color: "#20232B" }}>*</b> is the 6-week default because nothing has been set for that group yet.
+            Every figure is <b style={{ color: "#20232B" }}>at cost</b>. <b style={{ color: "#3F7A3F" }}>Green</b> is a buy: what this month needs on top of what is already on order, assuming you covered the earlier months — not a running total, so the columns do not double-count. <b style={{ color: "#B5432D" }}>Red</b> is the opposite, and it is a real number rather than a zero: how far past your cover target that group already sits. You cannot un-buy it, so it never becomes a negative buy — instead the surplus carries forward and shrinks the following month's need. Totals keep the two apart on purpose: an overbought group must never quietly fund another group's buy. <b style={{ color: "#20232B" }}>Cover</b> is how many weeks of forward sales you want to be holding; it comes from the WOS setting in Assumptions unless you type an override here. It is the single biggest lever on these numbers, which is what the strip below is for. <b style={{ color: "#20232B" }}>Selling vs plan</b> compares this month's actuals-to-date against what the plan expected by now, per category, capped at ±40%; groups with no synced actuals show “—” and stay on last year × growth, and the adjustment fades {Math.round(TREND_DECAY * 100)}% per month out because three weeks of one month says little about next spring. Expect the shortfall to move more than sales do — the cover target rises with the forecast while stock drains faster, so both sides widen at once. Months marked <span style={{ color: "#C99A3C" }}>†</span> take part of their cover from a window that wraps into next year, so that portion is estimated off a basis a year further back. Nothing here assumes anything about how long your vendors take.
           </span>
         </div>
       </div>
@@ -2107,55 +2054,6 @@ function OTBEngine() {
         </Modal>
       )}
 
-      {showLeadTimes && (
-        <Modal onClose={() => setShowLeadTimes(false)} title="Lead times">
-          <p className="text-xs mb-3" style={{ color: "#5C6270" }}>
-            How many weeks from placing an order to having it on the floor. This is the input the
-            Buy Board derives everything else from: cover weeks = lead + {REVIEW_WEEKS}w re-plan
-            cycle + {SAFETY_WEEKS}w safety, and "order by" counts the lead back from the first of
-            the month. Vendor entries win over group entries; a group served by several vendors
-            takes its slowest, because the group isn't shoppable until the last piece lands.
-          </p>
-          <div style={{ color: "#5C6270", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider mb-2">By planning group</div>
-          <div className="grid grid-cols-2 gap-x-6 gap-y-1 mb-5">
-            {groupNames.filter((g) => (typesByGroup[g] || []).length).map((g) => (
-              <label key={g} className="flex items-center justify-between gap-2 text-xs py-1" style={{ borderBottom: "1px solid #EDE9DE" }}>
-                <span style={{ color: "#20232B" }}>{g}</span>
-                <span className="flex items-center gap-1">
-                  <input type="number" min="0" max="52" value={leadWeeks[g] === undefined ? "" : leadWeeks[g]} placeholder="6"
-                    onChange={(e) => setLeadWeeks((prev) => ({ ...prev, [g]: e.target.value }))}
-                    className="w-16 border rounded px-2 py-1" style={{ borderColor: "#DCD5C4" }} />
-                  <span style={{ color: "#8B8F98" }}>wk</span>
-                </span>
-              </label>
-            ))}
-          </div>
-          <div style={{ color: "#5C6270", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider mb-2">By vendor</div>
-          {Object.keys(vendorTypes).length === 0 ? (
-            <p className="text-xs" style={{ color: "#8B8F98" }}>
-              No vendor list loaded yet. Open <b>Vendors</b> and load a range — that's where the
-              vendor-to-product-type mapping comes from — then vendors will be listed here.
-            </p>
-          ) : (
-            <div className="grid grid-cols-2 gap-x-6 gap-y-1" style={{ maxHeight: 260, overflow: "auto" }}>
-              {Object.keys(vendorTypes).sort().map((v) => (
-                <label key={v} className="flex items-center justify-between gap-2 text-xs py-1" style={{ borderBottom: "1px solid #EDE9DE" }}>
-                  <span style={{ color: "#20232B" }}>{v}</span>
-                  <span className="flex items-center gap-1">
-                    <input type="number" min="0" max="52" value={vendorLeadWeeks[v] === undefined ? "" : vendorLeadWeeks[v]} placeholder="—"
-                      onChange={(e) => setVendorLeadWeeks((prev) => ({ ...prev, [v]: e.target.value }))}
-                      className="w-16 border rounded px-2 py-1" style={{ borderColor: "#DCD5C4" }} />
-                    <span style={{ color: "#8B8F98" }}>wk</span>
-                  </span>
-                </label>
-              ))}
-            </div>
-          )}
-          <div className="flex justify-end mt-4">
-            <button onClick={() => setShowLeadTimes(false)} className="text-xs px-3 py-2 rounded" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 600 }}>Done</button>
-          </div>
-        </Modal>
-      )}
       {showGroups && (
         <Modal onClose={() => setShowGroups(false)} title="Planning groups">
           <div className="p-3 rounded mb-3" style={{ background: "#F1EEE6" }}>
