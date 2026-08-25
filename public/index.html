@@ -245,6 +245,10 @@ function OTBEngine() {
   const [showBuyBoard, setShowBuyBoard] = useState(false);
   const [buyView, setBuyView] = useState("month");     // "month" = one month in detail, "season" = all 12
   const [buyBy, setBuyBy] = useState("group");         // rows: planning group, or Shopify category
+  // What the 12-month grid shows. The buy number on its own is not judgeable - a $0 buy
+  // reads the same whether the group is genuinely covered or whether nothing is coming and
+  // the opening stock is masking it. These flip the same grid to the three inputs behind it.
+  const [boardRow, setBoardRow] = useState("buy");     // buy | coming | selling | cover
   const [useTrend, setUseTrend] = useState(true);
   const [coverOverride, setCoverOverride] = useState("");   // blank = derive from lead time
   const [expandedPaceCat, setExpandedPaceCat] = useState(null);
@@ -655,6 +659,31 @@ function OTBEngine() {
       });
     }
 
+    // Planned growth vs the growth actually running, both against LAST YEAR - which is the
+    // comparison a buy hangs on. "Selling vs plan" answers a different question (are we
+    // hitting the plan) and can read fine while the plan itself is far too low: a category
+    // planned at +3% and running at +22% will show a modest miss and a modest buy, and the
+    // buy is then a floor, not an answer. Measured off the current month only, pro-rated -
+    // earlier months roll off the front of the grid, so there is no season-to-date here.
+    function growthRead(types) {
+      let act = 0, lyPaced = 0, plan = 0, ly = 0, seen = 0;
+      types.forEach((t) => {
+        const r = getRow(t, curM);
+        const a = getAssumptions(CATEGORY_OF[t]);
+        const l = num(r.lySales);
+        ly += l;
+        plan += l * (1 + a.growthPct / 100);
+        if (r.actualSales === "" || r.actualSales === undefined) return;
+        act += num(r.actualSales);
+        lyPaced += l * paceRatio;
+        seen++;
+      });
+      return {
+        planned: ly > 0 ? plan / ly - 1 : null,
+        running: (seen > 0 && lyPaced > 250) ? act / lyPaced - 1 : null,
+      };
+    }
+
     const idx = monthCursor;
     // Rows are planning groups by default. Category view exists because that is how
     // vendors, budgets and the outside world are organised - but note it nets less:
@@ -673,8 +702,9 @@ function OTBEngine() {
       const trend = tvals.length ? tvals.reduce((a, b) => a + b, 0) / tvals.length : null;
       const sens = [6, 8, 10, 12].map((w) => ({ w, buy: seriesForGroup(types, w, useTrend)[idx].buy }));
       return { g, types, cover, trend, buy: s.buy, net: s.net, rawBuy: rawRow.buy, cogs: s.cogs, onOrder: s.onOrder,
-               target: s.target, short: s.short, sens,
-               allBuys: full.map((x) => x.buy), allNet: full.map((x) => x.net), allShort: full.map((x) => x.short) };
+               target: s.target, short: s.short, sens, growth: growthRead(types),
+               allBuys: full.map((x) => x.buy), allNet: full.map((x) => x.net), allShort: full.map((x) => x.short),
+               allCogs: full.map((x) => x.cogs), allOnOrder: full.map((x) => x.onOrder) };
     }).filter((r) => r.types.length);
 
     return {
@@ -688,6 +718,45 @@ function OTBEngine() {
       anyTrend: Object.values(trendByCat).some((x) => x != null),
     };
   }, [data, assumptions, startingBOM, months, planGroups, groupNames, typesByGroup, coverOverride, useTrend, buyBy, monthCursor, dailySales]);
+
+  // ---- 12-month grid: what each row mode shows -------------------------------
+  // Same table, four different readings of the same month. The buy figure is the
+  // conclusion; the other three are the evidence, and without them a $0 has no
+  // interpretation. Cover here is deliberately the crude one - what is arriving in
+  // the month against what the month sells - because that is the number a buyer can
+  // sanity-check against a delivery calendar.
+  const BOARD_ROW_MODES = [["buy", "Buy"], ["coming", "Coming in"], ["selling", "Selling"], ["cover", "Cover"]];
+  const NEUTRAL = "#5C6270";
+  function coverStyle(x) {
+    if (x == null) return { color: "#B0B4BC" };
+    if (x < 0.5) return { color: "#B5432D", fontWeight: 600 };      // thin - little arriving against the month's selling
+    if (x > 2.5) return { color: "#C99A3C", fontWeight: 600 };      // heavy - far more arriving than the month can sell
+    return { color: NEUTRAL };
+  }
+  function boardCell(mode, row, i) {
+    if (mode === "coming") return { text: money(row.allOnOrder[i]), style: { color: row.allOnOrder[i] > 0.005 ? NEUTRAL : "#B0B4BC" } };
+    if (mode === "selling") return { text: money(row.allCogs[i]), style: { color: NEUTRAL } };
+    if (mode === "cover") {
+      const c = row.allCogs[i] > 1 ? row.allOnOrder[i] / row.allCogs[i] : null;
+      return { text: c == null ? "—" : c.toFixed(2) + "×", style: coverStyle(c) };
+    }
+    const n = row.allNet[i];
+    return {
+      text: money(n), short: row.allShort[i],
+      style: { color: n > 0 ? "#3F7A3F" : n < 0 ? "#B5432D" : "#B0B4BC", fontWeight: n > 0 ? 600 : 400 },
+      tint: n > 0 ? "#F4F8F3" : null,
+    };
+  }
+  function boardRowTotal(mode, row) {
+    if (mode === "coming") return money(row.allOnOrder.reduce((a, b) => a + b, 0));
+    if (mode === "selling") return money(row.allCogs.reduce((a, b) => a + b, 0));
+    if (mode === "cover") {
+      const o = row.allOnOrder.reduce((a, b) => a + b, 0), c = row.allCogs.reduce((a, b) => a + b, 0);
+      return c > 1 ? (o / c).toFixed(2) + "×" : "—";
+    }
+    return money(row.allBuys.reduce((a, b) => a + b, 0));
+  }
+  function pct(x) { return x == null ? "—" : `${x >= 0 ? "+" : ""}${(x * 100).toFixed(0)}%`; }
 
   // Month Pace: for the current real-world month (months[0]), compares actual sales/COGS-to-date
   // against where we'd expect to be given the forecast and how far through the calendar month we are.
@@ -1502,6 +1571,16 @@ function OTBEngine() {
               </button>
             ))}
           </div>
+          {buyView === "season" && (
+            <div className="flex rounded overflow-hidden" style={{ border: "1px solid #DCD5C4" }}>
+              {BOARD_ROW_MODES.map(([k, lbl]) => (
+                <button key={k} onClick={() => setBoardRow(k)} className="text-xs px-3 py-1.5"
+                  style={{ background: boardRow === k ? "#8C6E4A" : "#FFFFFF", color: boardRow === k ? "#F1EEE6" : "#5C6270", fontWeight: boardRow === k ? 700 : 400 }}>
+                  {lbl}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
         {buyView === "season" ? (
@@ -1514,7 +1593,7 @@ function OTBEngine() {
                   {months.map((m, i) => (
                     <th key={m} className="text-right py-2 px-3" style={{ minWidth: 98, background: i === monthCursor ? "#C99A3C" : "#2A303B", color: i === monthCursor ? "#20232B" : "#EDE7DA" }}>{monthLabel(m)}</th>
                   ))}
-                  <th className="text-right py-2 px-3" style={{ background: "#C99A3C", color: "#20232B", minWidth: 115 }}>SEASON</th>
+                  <th className="text-right py-2 px-3" style={{ background: "#C99A3C", color: "#20232B", minWidth: 115 }}>{boardRow === "cover" ? "YEAR" : "SEASON"}</th>
                 </tr>
               </thead>
               <tbody>
@@ -1522,34 +1601,65 @@ function OTBEngine() {
                   <tr key={r.g} style={{ borderTop: "1px solid #EDE9DE" }}>
                     <td className="py-2 px-3" style={{ position: "sticky", left: 0, zIndex: 1, background: "#FFFFFF", fontWeight: 700, color: "#20232B" }}>
                       {r.g} <span style={{ color: "#8B8F98", fontWeight: 400 }}>({r.cover.weeks}w cover)</span>
+                      {/* Planned growth against the growth actually running. When these diverge the
+                          buy figure on this row is a floor, and the row now says so on its own. */}
+                      {r.growth.planned != null && (
+                      <div style={{ fontSize: 10, fontWeight: 400, color: "#8B8F98", marginTop: 1 }}>
+                        plan {pct(r.growth.planned)}
+                        {r.growth.running != null && (
+                          <span style={{
+                            color: r.growth.planned != null && r.growth.running - r.growth.planned > 0.08 ? "#3F7A3F"
+                                 : r.growth.planned != null && r.growth.running - r.growth.planned < -0.08 ? "#B5432D" : "#8B8F98",
+                            fontWeight: r.growth.planned != null && Math.abs(r.growth.running - r.growth.planned) > 0.08 ? 700 : 400,
+                          }}> · running {pct(r.growth.running)}</span>
+                        )}
+                      </div>
+                      )}
                     </td>
-                    {r.allNet.map((n, i) => (
-                      <td key={i} className="text-right py-2 px-3"
-                        style={{
-                          color: n > 0 ? "#3F7A3F" : n < 0 ? "#B5432D" : "#B0B4BC",
-                          background: i === monthCursor ? "#FBF3E2" : n > 0 ? "#F4F8F3" : "transparent",
-                          fontWeight: n > 0 ? 600 : 400,
-                        }}>
-                        {money(n)}{r.allShort[i] ? <span style={{ color: "#C99A3C" }}> †</span> : null}
-                      </td>
-                    ))}
-                    <td className="text-right py-2 px-3" style={{ background: "#FBF3E2", fontWeight: 700, color: "#3F7A3F" }}>
-                      {money(r.allBuys.reduce((a, b) => a + b, 0))}
+                    {months.map((m, i) => {
+                      const c = boardCell(boardRow, r, i);
+                      return (
+                        <td key={i} className="text-right py-2 px-3"
+                          style={{ ...c.style, background: i === monthCursor ? "#FBF3E2" : (c.tint || "transparent") }}>
+                          {c.text}{c.short ? <span style={{ color: "#C99A3C" }}> †</span> : null}
+                        </td>
+                      );
+                    })}
+                    <td className="text-right py-2 px-3" style={{ background: "#FBF3E2", fontWeight: 700, color: boardRow === "buy" ? "#3F7A3F" : "#20232B" }}>
+                      {boardRowTotal(boardRow, r)}
                     </td>
                   </tr>
                 ))}
                 <tr style={{ borderTop: "2px solid #20232B", background: "#F1EEE6" }}>
                   <td className="py-2 px-3" style={{ position: "sticky", left: 0, zIndex: 1, background: "#F1EEE6", fontWeight: 700 }}>TOTAL</td>
-                  {months.map((m, i) => (
-                    <td key={i} className="text-right py-2 px-3" style={{ fontWeight: 700, background: i === monthCursor ? "#FBF3E2" : "transparent" }}>
-                      <div style={{ color: "#3F7A3F" }}>{money(buyBoard.rows.reduce((a, r) => a + r.allBuys[i], 0))}</div>
-                      <div style={{ color: "#B5432D", fontWeight: 400, fontSize: 11 }}>
-                        {money(buyBoard.rows.reduce((a, r) => a + Math.min(0, r.allNet[i]), 0))}
-                      </div>
-                    </td>
-                  ))}
+                  {months.map((m, i) => {
+                    const sumBuy = buyBoard.rows.reduce((a, r) => a + r.allBuys[i], 0);
+                    const sumOver = buyBoard.rows.reduce((a, r) => a + Math.min(0, r.allNet[i]), 0);
+                    const sumOn = buyBoard.rows.reduce((a, r) => a + r.allOnOrder[i], 0);
+                    const sumCogs = buyBoard.rows.reduce((a, r) => a + r.allCogs[i], 0);
+                    const cov = sumCogs > 1 ? sumOn / sumCogs : null;
+                    return (
+                      <td key={i} className="text-right py-2 px-3" style={{ fontWeight: 700, background: i === monthCursor ? "#FBF3E2" : "transparent" }}>
+                        {boardRow === "buy" ? (
+                          <React.Fragment>
+                            <div style={{ color: "#3F7A3F" }}>{money(sumBuy)}</div>
+                            <div style={{ color: "#B5432D", fontWeight: 400, fontSize: 11 }}>{money(sumOver)}</div>
+                          </React.Fragment>
+                        ) : boardRow === "coming" ? <div style={{ color: "#20232B" }}>{money(sumOn)}</div>
+                        : boardRow === "selling" ? <div style={{ color: "#20232B" }}>{money(sumCogs)}</div>
+                        : <div style={coverStyle(cov)}>{cov == null ? "—" : cov.toFixed(2) + "×"}</div>}
+                      </td>
+                    );
+                  })}
                   <td className="text-right py-2 px-3" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 700 }}>
-                    {money(buyBoard.rows.reduce((a, r) => a + r.allBuys.reduce((x, y) => x + y, 0), 0))}
+                    {boardRow === "coming" ? money(buyBoard.rows.reduce((a, r) => a + r.allOnOrder.reduce((x, y) => x + y, 0), 0))
+                     : boardRow === "selling" ? money(buyBoard.rows.reduce((a, r) => a + r.allCogs.reduce((x, y) => x + y, 0), 0))
+                     : boardRow === "cover" ? (() => {
+                         const o = buyBoard.rows.reduce((a, r) => a + r.allOnOrder.reduce((x, y) => x + y, 0), 0);
+                         const c = buyBoard.rows.reduce((a, r) => a + r.allCogs.reduce((x, y) => x + y, 0), 0);
+                         return c > 1 ? (o / c).toFixed(2) + "×" : "—";
+                       })()
+                     : money(buyBoard.rows.reduce((a, r) => a + r.allBuys.reduce((x, y) => x + y, 0), 0))}
                   </td>
                 </tr>
               </tbody>
@@ -1562,6 +1672,7 @@ function OTBEngine() {
             <thead>
               <tr style={{ background: "#20232B", color: "#EDE7DA" }}>
                 <th className="text-left py-2 px-3">{buyBy === "category" ? "Category" : "Planning group"}</th>
+                <th className="text-right py-2 px-3">Growth: plan / running</th>
                 <th className="text-right py-2 px-3">Selling vs plan</th>
                 <th className="text-right py-2 px-3">Cover</th>
                 <th className="text-right py-2 px-3">Already coming</th>
@@ -1572,6 +1683,18 @@ function OTBEngine() {
               {buyBoard.rows.map((r) => (
                 <tr key={r.g} style={{ borderTop: "1px solid #EDE9DE", background: r.buy > 0 ? "#FFFFFF" : "#FAF8F3" }}>
                   <td className="py-2 px-3" style={{ fontWeight: 700, color: "#20232B" }}>{r.g} <span style={{ color: "#8B8F98", fontWeight: 400 }}>({r.types.length})</span></td>
+                  {/* The buy above is only as good as the growth under it. A row planned at +3%
+                      and running at +22% is being under-bought by the plan, not by the maths. */}
+                  <td className="text-right py-2 px-3" style={{ color: "#5C6270" }}>
+                    <span style={{ color: "#8B8F98" }}>{pct(r.growth.planned)}</span>
+                    <span style={{ color: "#B0B4BC" }}> / </span>
+                    <span style={{
+                      color: r.growth.running == null || r.growth.planned == null ? "#B0B4BC"
+                           : r.growth.running - r.growth.planned > 0.08 ? "#3F7A3F"
+                           : r.growth.running - r.growth.planned < -0.08 ? "#B5432D" : "#5C6270",
+                      fontWeight: r.growth.running != null && r.growth.planned != null && Math.abs(r.growth.running - r.growth.planned) > 0.08 ? 700 : 400,
+                    }}>{pct(r.growth.running)}</span>
+                  </td>
                   <td className="text-right py-2 px-3" style={{ color: r.trend == null ? "#B0B4BC" : r.trend < 0.95 ? "#B5432D" : r.trend > 1.05 ? "#5B7A5B" : "#5C6270" }}>
                     {r.trend == null ? "—" : `${r.trend >= 1 ? "+" : ""}${((r.trend - 1) * 100).toFixed(0)}%`}
                   </td>
@@ -1582,7 +1705,7 @@ function OTBEngine() {
               ))}
               <tr style={{ borderTop: "2px solid #20232B", background: "#F1EEE6" }}>
                 <td className="py-2 px-3" style={{ fontWeight: 700 }}>TOTAL</td>
-                <td colSpan={3}></td>
+                <td colSpan={4}></td>
                 <td className="text-right py-2 px-3" style={{ fontWeight: 700, background: "#C99A3C", color: "#20232B" }}>
                   <span style={{ color: "#20232B" }}>{money(buyBoard.total)}</span>
                   <span style={{ color: "#7A2E1E", fontWeight: 400 }}> / {money(buyBoard.over)}</span>
@@ -1616,7 +1739,7 @@ function OTBEngine() {
         <div className="mt-4 flex items-start gap-2 text-xs" style={{ color: "#8B8F98" }}>
           <Icon.info />
           <span>
-            Every figure is <b style={{ color: "#20232B" }}>at cost</b>. <b style={{ color: "#3F7A3F" }}>Green</b> is a buy: what this month needs on top of what is already on order, assuming you covered the earlier months — not a running total, so the columns do not double-count. <b style={{ color: "#B5432D" }}>Red</b> is the opposite, and it is a real number rather than a zero: how far past your cover target that group already sits. You cannot un-buy it, so it never becomes a negative buy — instead the surplus carries forward and shrinks the following month's need. Totals keep the two apart on purpose: an overbought group must never quietly fund another group's buy. <b style={{ color: "#20232B" }}>By category</b> matches how vendors and budgets are organised, but it nets less than <b style={{ color: "#20232B" }}>by planning group</b> — Fashion Tops and Tee/Tunic offset each other as one Tops group and cannot as two categories, which is worth about $22,000 over a year. <b style={{ color: "#20232B" }}>Cover</b> is how many weeks of forward sales you want to be holding; it comes from the WOS setting in Assumptions unless you type an override here. It is the single biggest lever on these numbers, which is what the strip below is for. <b style={{ color: "#20232B" }}>Selling vs plan</b> compares this month's actuals-to-date against what the plan expected by now, per category, capped at ±40%; groups with no synced actuals show “—” and stay on last year × growth, and the adjustment fades {Math.round(TREND_DECAY * 100)}% per month out because three weeks of one month says little about next spring. Expect the shortfall to move more than sales do — the cover target rises with the forecast while stock drains faster, so both sides widen at once. Months marked <span style={{ color: "#C99A3C" }}>†</span> take part of their cover from a window that wraps into next year, so that portion is estimated off a basis a year further back. Nothing here assumes anything about how long your vendors take.
+            Every figure is <b style={{ color: "#20232B" }}>at cost</b>. <b style={{ color: "#3F7A3F" }}>Green</b> is a buy: what this month needs on top of what is already on order, assuming you covered the earlier months — not a running total, so the columns do not double-count. <b style={{ color: "#B5432D" }}>Red</b> is the opposite, and it is a real number rather than a zero: how far past your cover target that group already sits. You cannot un-buy it, so it never becomes a negative buy — instead the surplus carries forward and shrinks the following month's need. Totals keep the two apart on purpose: an overbought group must never quietly fund another group's buy. <b style={{ color: "#20232B" }}>By category</b> matches how vendors and budgets are organised, but it nets less than <b style={{ color: "#20232B" }}>by planning group</b> — Fashion Tops and Tee/Tunic offset each other as one Tops group and cannot as two categories, which is worth about $22,000 over a year. <b style={{ color: "#20232B" }}>Cover</b> is how many weeks of forward sales you want to be holding; it comes from the WOS setting in Assumptions unless you type an override here. It is the single biggest lever on these numbers, which is what the strip below is for. <b style={{ color: "#20232B" }}>Growth: plan / running</b> is the check on the buy itself. The left figure is the growth you set in Assumptions; the right is the growth actually running against last year, measured on this month to date and pro-rated. When the right number is well above the left, the forecast under it is too low and the buy is a <i>floor</i> rather than an answer — the row is flagged green to say so. Well below, and the buy is overstated. This is a different question from Selling vs plan, which can look calm while the plan itself is far too small. On the 12-month grid the same two figures sit under every row name, and <b style={{ color: "#20232B" }}>Buy / Coming in / Selling / Cover</b> flips that grid between the answer and the three numbers behind it: what is scheduled to arrive, what the month sells at cost, and the ratio of the two. Cover there is the blunt monthly version — arriving ÷ selling — not the weeks-of-cover target; under 0.50× means little is landing against what the month has to sell, over 2.50× means far more is landing than it can. That is the number to hold against a delivery calendar, and it is where a $0 buy stops being ambiguous. <b style={{ color: "#20232B" }}>Selling vs plan</b> compares this month's actuals-to-date against what the plan expected by now, per category, capped at ±40%; groups with no synced actuals show “—” and stay on last year × growth, and the adjustment fades {Math.round(TREND_DECAY * 100)}% per month out because three weeks of one month says little about next spring. Expect the shortfall to move more than sales do — the cover target rises with the forecast while stock drains faster, so both sides widen at once. Months marked <span style={{ color: "#C99A3C" }}>†</span> take part of their cover from a window that wraps into next year, so that portion is estimated off a basis a year further back. Nothing here assumes anything about how long your vendors take.
           </span>
         </div>
       </div>
