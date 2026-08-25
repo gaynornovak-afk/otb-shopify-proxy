@@ -328,6 +328,27 @@ function OTBEngine() {
   function getAssumptions(cat) { return assumptions[cat] || defaultAssumptions(); }
   function setAssumption(cat, patch) { setAssumptions((prev) => ({ ...prev, [cat]: { ...getAssumptions(cat), ...patch } })); }
   function getRow(type, mKey) { return (data[type] && data[type][mKey]) || emptyRow(); }
+  // An outstanding PO whose expected date has slipped behind the start of the plan
+  // is still stock you are waiting on - it just hasn't turned up. On its own month
+  // key nothing would ever read it, so the money silently vanishes from the plan.
+  // Counting it into the first month AT READ TIME rather than rewriting it on
+  // import means it stays correct however old the imported data is, and the
+  // vendor's original date is preserved. Receipts are deliberately not treated
+  // this way: anything received before the window is already inside the starting
+  // BOM, so adding it again would double-count.
+  function overdueBalance(type) {
+    const byMonth = data[type];
+    if (!byMonth || !months.length) return 0;
+    const first = months[0];
+    let sum = 0;
+    Object.keys(byMonth).forEach((k) => { if (k < first) sum += num(byMonth[k].balanceToReceive); });
+    return sum;
+  }
+  // Store-wide total, for the note on the Buy Board.
+  const overdueTotal = useMemo(
+    () => TAXONOMY.reduce((s, [t]) => s + overdueBalance(t), 0),
+    [data, months]
+  );
   function setRow(type, mKey, patch) {
     setData((prev) => {
       const typeData = { ...(prev[type] || {}) };
@@ -394,7 +415,7 @@ function OTBEngine() {
       const row = getRow(type, mKey);
       const forecastSales = forecasts[t].forecastSales;
       const forecastCOGS = forecasts[t].forecastCOGS;
-      const expected = num(row.received) + num(row.balanceToReceive);
+      const expected = num(row.received) + num(row.balanceToReceive) + (t === 0 ? overdueBalance(type) : 0);
       const hasActualsThisMonth = row.actualSales !== "" && row.actualSales !== undefined;
       const actualBOMForThisMonth = t === 0 ? start : actualBOMChain;
 
@@ -605,7 +626,7 @@ function OTBEngine() {
         const tf = trendOn && raw != null ? 1 + (raw - 1) * Math.pow(TREND_DECAY, i) : 1;
         return sum + num(getRow(t, m).lySales) * (1 + a.growthPct / 100) * tf * (1 - a.gmPct / 100);
       }, 0));
-      const onOrder = months.map((m) => types.reduce((s, t) => { const r = getRow(t, m); return s + num(r.received) + num(r.balanceToReceive); }, 0));
+      const onOrder = months.map((m, i) => types.reduce((s, t) => { const r = getRow(t, m); return s + num(r.received) + num(r.balanceToReceive) + (i === 0 ? overdueBalance(t) : 0); }, 0));
       // Same window as the grid: starts the month AFTER the one being planned, and
       // wraps around the year rather than stopping at the edge of the grid.
       function wosAt(t) {
@@ -894,7 +915,7 @@ function OTBEngine() {
     const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
     const monthOf = (dateStr) => { const s = (dateStr || "").trim(); return /^\d{4}-\d{2}/.test(s) ? s.slice(0, 7) : null; };
     const totals = {}; // type -> month -> { received, balance }
-    let matchedRows = 0, skippedRows = 0, overduePulled = 0, beyondHorizon = 0;
+    let matchedRows = 0, skippedRows = 0;
     importPreview.forEach((r) => {
       const typeName = (r["Product Type"] || "").trim();
       if (!typeName || !validTypes.has(typeName.toLowerCase())) { skippedRows++; return; }
@@ -903,29 +924,16 @@ function OTBEngine() {
       const received = Number(r["Total Cost Received"]) || 0;
       const balance = Math.max(0, ordered - received);
       const receivedMonth = monthOf(r["Received Date"]);
-      let expectedMonth = monthOf(r["Expected Date"]) || receivedMonth || months[monthCursor];
-      // An overdue PO is still stock you are waiting on. Once its expected date
-      // slips behind the plan's first month it lands on a month key nothing ever
-      // reads, and the money silently disappears from the plan - so pull it
-      // forward into the current month, where it can actually be seen and acted on.
-      // Receipts are left alone on purpose: anything received before the window
-      // is already sitting inside the starting BOM, and adding it again would
-      // double-count it.
-      if (expectedMonth < months[0]) {
-        overduePulled += balance;
-        expectedMonth = months[0];
-      } else if (expectedMonth > months[months.length - 1]) {
-        // Beyond the visible year - genuinely next year's plan, not this one's.
-        beyondHorizon += balance;
-        expectedMonth = null;
-      }
+      const expectedMonth = monthOf(r["Expected Date"]) || receivedMonth || months[monthCursor];
+      // Dates are stored exactly as the vendor gave them. Overdue POs are dealt
+      // with when the plan is read, not rewritten here - see overdueBalance().
       matchedRows++;
       totals[match] = totals[match] || {};
       if (received > 0 && receivedMonth) {
         totals[match][receivedMonth] = totals[match][receivedMonth] || { received: 0, balance: 0 };
         totals[match][receivedMonth].received += received;
       }
-      if (balance > 0.005 && expectedMonth) {
+      if (balance > 0.005) {
         totals[match][expectedMonth] = totals[match][expectedMonth] || { received: 0, balance: 0 };
         totals[match][expectedMonth].balance += balance;
       }
@@ -949,8 +957,6 @@ function OTBEngine() {
       return next;
     });
     setImportSummary(`Applied ${matchedRows} line items across ${Object.keys(totals).length} product types (on-order replaced for those types).`
-      + (overduePulled > 0.005 ? ` ${money(overduePulled)} of overdue POs (expected before ${monthLabel(months[0])}) pulled forward into ${monthLabel(months[0])} - they had not arrived, so they are still inbound.` : "")
-      + (beyondHorizon > 0.005 ? ` ${money(beyondHorizon)} expected beyond ${monthLabel(months[months.length - 1])} is outside this plan year and excluded.` : "")
       + (skippedRows ? ` ⚠ Skipped ${skippedRows} row(s) whose Product Type didn't match the taxonomy - those POs are NOT counted as inbound.` : ""));
     setShowImport(false); setImportText(""); setImportPreview(null);
   }
@@ -1460,6 +1466,13 @@ function OTBEngine() {
           </div>
         </div>
 
+        {overdueTotal > 0.005 && (
+          <div className="mb-3 px-3 py-2 rounded text-xs" style={{ background: "#FBF3E2", border: "1px solid #C99A3C", color: "#20232B" }}>
+            <b>{money(overdueTotal)} of purchase orders are overdue</b> — expected before {monthLabel(months[0])} and still not received.
+            They are counted as arriving in {monthLabel(months[0])}, because they have not turned up and are still owed to you.
+            If any are dead, close them in your PO system and re-import.
+          </div>
+        )}
         <div className="flex flex-wrap items-center gap-4 mb-3">
           <label className="text-xs flex items-center gap-2" style={{ color: "#20232B" }}>
             <input type="checkbox" checked={useTrend} onChange={(e) => setUseTrend(e.target.checked)} />
