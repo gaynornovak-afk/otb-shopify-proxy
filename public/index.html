@@ -1,3 +1,9 @@
+
+
+
+
+
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -355,24 +361,38 @@ function OTBEngine() {
       return { forecastSales, forecastCOGS };
     });
     const WEEKS_PER_MONTH = 4.33;
-    // WOS Target EOM $ at month t = sum of forecasted COGS across the next `wos` weeks,
-    // starting at month t, prorating the final partial month. Runs out of data (and
-    // understates the target) within `wos` weeks of the end of the visible 12 months.
-    // Returns the target and how many weeks of forecast data it actually found.
-    // Near the end of the visible 12 months the window runs out of future months,
-    // so weeksFound < wos and the target (and any buy derived from it) is
-    // understated by construction - the caller flags those months rather than
-    // letting a structurally low number read as "nothing to buy."
+    // WOS Target EOM $ at month t = the COGS you need to be covered for once month
+    // t has finished: `wos` weeks of forecast starting at month t+1, prorating the
+    // final partial month.
+    //
+    // Two corrections live here, both found by rebuilding this model in a spreadsheet.
+    //
+    // 1. START AT t+1, NOT t. The value this is compared against (targetEOM) is stock
+    //    at the END of month t, by which point month t's own sales have already gone.
+    //    Summing from t asked you to still be holding August's sales after August had
+    //    sold them, which inflated every buy by roughly the difference between the
+    //    month entering the window and the one leaving it.
+    //
+    // 2. WRAP AROUND THE YEAR. The window used to stop dead at the edge of the visible
+    //    12 months, so the last months' targets were understated by construction and
+    //    read as "nothing to buy" - June came out at $0 when it was really the second
+    //    biggest buy of the year. The retail year is a cycle: June's cover is
+    //    Jun+Jul+Aug, and August is right there at the start of the grid. Wrapped
+    //    months get another year of growth applied and are flagged as estimated,
+    //    because their basis is a year further back than everything else.
     function wosTargetAt(t) {
-      let weeksLeft = wos, total = 0, idx = t, weeksFound = 0;
-      while (weeksLeft > 0 && idx < forecasts.length) {
+      const n = forecasts.length;
+      let weeksLeft = wos, total = 0, idx = t + 1, weeksFound = 0, wrapped = false;
+      while (weeksLeft > 0) {
+        const lap = Math.floor(idx / n);
+        if (lap > 0) wrapped = true;
         const take = Math.min(weeksLeft, WEEKS_PER_MONTH);
-        total += forecasts[idx].forecastCOGS * (take / WEEKS_PER_MONTH);
+        total += forecasts[idx % n].forecastCOGS * Math.pow(1 + growth, lap) * (take / WEEKS_PER_MONTH);
         weeksLeft -= take;
         weeksFound += take;
         idx++;
       }
-      return { total, weeksFound };
+      return { total, weeksFound, wrapped };
     }
 
     let actualBOMChain = start;
@@ -397,7 +417,9 @@ function OTBEngine() {
       const targetEOM = basis + expected - forecastCOGS;
       const wos_ = wosTargetAt(t);
       const wosTargetEOM = wos_.total;
-      const wosShort = wos_.weeksFound < wos - 0.01;
+      // No longer "short" - the window always fills now. Flagged instead when part
+      // of it wrapped past the end of the year and is therefore estimated.
+      const wosEstimated = wos_.wrapped;
       const overUnder = wosTargetEOM - targetEOM;
       const buyAction = overUnder > 0 ? "Buy" : overUnder < 0 ? "Don't Buy" : "On Target";
 
@@ -421,7 +443,7 @@ function OTBEngine() {
       const planBOMPrev = t === 0 || isOverride ? basis : prevWosTarget;
       const buyRaw = wosTargetEOM - (planBOMPrev + expected - forecastCOGS);
 
-      out.push({ mKey, row, forecastSales, forecastCOGS, expected, basis, basisSource, targetEOM, wosTargetEOM, wosShort, overUnder, buyAction, buyRaw });
+      out.push({ mKey, row, forecastSales, forecastCOGS, expected, basis, basisSource, targetEOM, wosTargetEOM, wosEstimated, overUnder, buyAction, buyRaw });
       actualBOMChain = actualBOMForThisMonth - num(row.actualCogs) + num(row.received);
       prevTargetEOM = targetEOM;
       prevWosTarget = wosTargetEOM;
@@ -482,7 +504,7 @@ function OTBEngine() {
   // A month is flagged when its cover window ran past the end of the 12-month
   // horizon for any member type, so its buy is understated by construction.
   function buyPlanShortAt(types, monthIdx) {
-    return types.some((t) => seriesByType[t][monthIdx].wosShort);
+    return types.some((t) => seriesByType[t][monthIdx].wosEstimated);
   }
   // Total across the months currently on screen - the market budget.
   function buyPlanWindowTotal(types) {
@@ -592,6 +614,10 @@ function OTBEngine() {
     // Same floor-and-carry plan as the grid metric, but on the group's aggregate with
     // its own cover weeks and the trend-adjusted forecast.
     function seriesForGroup(types, coverWeeks, trendOn) {
+      // Growth for the wrapped year. Groups can span categories, so take the first
+      // member's - growth is on the same default everywhere, and the wrapped months
+      // are an estimate regardless.
+      const GROWTH_FALLBACK = (getAssumptions(CATEGORY_OF[types[0]]) || { growthPct: 3 }).growthPct / 100;
       // Trend fades with distance. Three weeks of August is decent evidence about
       // September and nearly worthless about next May, so the adjustment decays toward
       // neutral rather than scaling the whole year by one partial month's read.
@@ -602,10 +628,19 @@ function OTBEngine() {
         return sum + num(getRow(t, m).lySales) * (1 + a.growthPct / 100) * tf * (1 - a.gmPct / 100);
       }, 0));
       const onOrder = months.map((m) => types.reduce((s, t) => { const r = getRow(t, m); return s + num(r.received) + num(r.balanceToReceive); }, 0));
+      // Same window as the grid: starts the month AFTER the one being planned, and
+      // wraps around the year rather than stopping at the edge of the grid.
       function wosAt(t) {
-        let left = coverWeeks, tot = 0, i = t, found = 0;
-        while (left > 0 && i < fc.length) { const take = Math.min(left, WPM); tot += fc[i] * (take / WPM); left -= take; found += take; i++; }
-        return { tot, found };
+        const n = fc.length;
+        let left = coverWeeks, tot = 0, i = t + 1, wrapped = false;
+        while (left > 0) {
+          const lap = Math.floor(i / n);
+          if (lap > 0) wrapped = true;
+          const take = Math.min(left, WPM);
+          tot += fc[i % n] * Math.pow(1 + GROWTH_FALLBACK, lap) * (take / WPM);
+          left -= take; i++;
+        }
+        return { tot, wrapped };
       }
       let bom = types.reduce((s, t) => s + num(startingBOM[t]), 0);
       return months.map((m, t) => {
@@ -613,7 +648,7 @@ function OTBEngine() {
         const before = bom + onOrder[t] - fc[t];
         const buy = Math.max(0, w.tot - before);
         bom = before + buy;
-        return { m, buy, cogs: fc[t], onOrder: onOrder[t], target: w.tot, short: w.found < coverWeeks - 0.01 };
+        return { m, buy, cogs: fc[t], onOrder: onOrder[t], target: w.tot, short: w.wrapped };
       });
     }
 
@@ -1908,14 +1943,14 @@ function OTBEngine() {
           <div className="mt-4 flex items-start gap-2 text-xs" style={{ color: "#8B8F98" }}>
             <Icon.info />
             <span>
-              <b style={{ color: "#20232B" }}>Buy Plan $</b> is what you write <i>this month</i>, at cost, assuming you bought to the cover target in every earlier month - not the cumulative gap Over/Under shows. Receipts already on order are netted out first, so a month reads $0 when what's landing already covers it, and any surplus carries forward to reduce the next month. Inside a planning group an overstocked type nets against a short one before anything is called a buy, so member rows will not sum to the group row. <b style={{ color: "#20232B" }}>TO BUY</b> totals the months currently on screen - scroll the window to match your market dates. Months marked <span style={{ color: "#C99A3C" }}>†</span> sit near the end of the 12-month horizon, where the forward cover window runs out of forecast data: those buys are understated by construction, not genuinely small.
+              <b style={{ color: "#20232B" }}>Buy Plan $</b> is what you write <i>this month</i>, at cost, assuming you bought to the cover target in every earlier month - not the cumulative gap Over/Under shows. Receipts already on order are netted out first, so a month reads $0 when what's landing already covers it, and any surplus carries forward to reduce the next month. Inside a planning group an overstocked type nets against a short one before anything is called a buy, so member rows will not sum to the group row. <b style={{ color: "#20232B" }}>TO BUY</b> totals the months currently on screen - scroll the window to match your market dates. Months marked <span style={{ color: "#C99A3C" }}>†</span> have a cover window that wraps past the end of the grid into next year, so part of the target is estimated from a basis a year further back. They are no longer understated - they used to read $0 - but treat them as a placeholder until next year's history exists.
             </span>
           </div>
         )}
         <div className="mt-4 flex items-start gap-2 text-xs" style={{ color: "#8B8F98" }}>
           <Icon.info />
           <span>
-            Target EOM $ = BOM $ + Expected receipts − Forecast COGS. BOM $ auto-rolls from actual COGS/receipts while actual sales are entered; once a month has no actual sales yet, it automatically switches to rolling forward from the prior month's Target EOM. WOS Target EOM $ = sum of forecasted COGS across the next N weeks (your WOS target) starting that month, prorated for partial months — a forward-looking target, not a single-month rate extrapolation, so it responds to seasonality. It understates near the end of the visible 12 months since there's no forecast data beyond that window to sum. Over/Under $ = WOS Target EOM − Target EOM. Positive = Buy. Click any row to open its full monthly ledger and edit inputs.
+            Target EOM $ = BOM $ + Expected receipts − Forecast COGS. BOM $ auto-rolls from actual COGS/receipts while actual sales are entered; once a month has no actual sales yet, it automatically switches to rolling forward from the prior month's Target EOM. WOS Target EOM $ = sum of forecasted COGS across the next N weeks (your WOS target) starting the month AFTER this one, prorated for partial months — it is measured against month-end stock, by which point this month's own sales have already gone, so the window has to look forward from there. The window wraps around the year rather than stopping at the edge of the grid, so the last months are no longer understated; the portion that wraps is estimated off a basis a year further back. Over/Under $ = WOS Target EOM − Target EOM. Positive = Buy. Click any row to open its full monthly ledger and edit inputs.
           </span>
         </div>
       </div>
