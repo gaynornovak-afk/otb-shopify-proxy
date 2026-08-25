@@ -243,7 +243,8 @@ function OTBEngine() {
   const [showMonthPace, setShowMonthPace] = useState(false);
   // --- Buy Board -------------------------------------------------------------
   const [showBuyBoard, setShowBuyBoard] = useState(false);
-  const [buyView, setBuyView] = useState("month"); // "month" = one month in detail, "season" = all 12
+  const [buyView, setBuyView] = useState("month");     // "month" = one month in detail, "season" = all 12
+  const [buyBy, setBuyBy] = useState("group");         // rows: planning group, or Shopify category
   const [useTrend, setUseTrend] = useState(true);
   const [coverOverride, setCoverOverride] = useState("");   // blank = derive from lead time
   const [expandedPaceCat, setExpandedPaceCat] = useState(null);
@@ -581,10 +582,9 @@ function OTBEngine() {
     // lead-time model here on purpose - how fast a vendor ships is something the
     // buyer knows and the software would only get wrong. This screen answers one
     // question: how much am I short for this month.
-    function coverForGroup(g) {
+    function coverFor(types) {
       const ov = num(coverOverride);
       if (ov) return { weeks: ov, source: "override" };
-      const types = typesByGroup[g] || [];
       const w = types.length ? getAssumptions(CATEGORY_OF[types[0]]).wosTarget : 12;
       return { weeks: w, source: "assumptions" };
     }
@@ -635,9 +635,15 @@ function OTBEngine() {
     }
 
     const idx = monthCursor;
-    const rows = groupNames.map((g) => {
-      const types = typesByGroup[g] || [];
-      const cover = coverForGroup(g);
+    // Rows are planning groups by default. Category view exists because that is how
+    // vendors, budgets and the outside world are organised - but note it nets less:
+    // Fashion Tops and Tee/Tunic can offset each other as one Tops group and cannot
+    // as two categories, which is worth real money over a year.
+    const rowSets = buyBy === "category"
+      ? CATEGORIES.map((c) => ({ name: c, types: TYPES_BY_CATEGORY[c] || [] }))
+      : groupNames.map((g) => ({ name: g, types: typesByGroup[g] || [] }));
+    const rows = rowSets.map(({ name: g, types }) => {
+      const cover = coverFor(types);
       const full = seriesForGroup(types, cover.weeks, useTrend);
       const s = full[idx];
       const rawRow = seriesForGroup(types, cover.weeks, false)[idx];
@@ -660,7 +666,7 @@ function OTBEngine() {
       paceRatio, weekdayMatched: dp.complete, daysElapsed, totalDays, storeTrend,
       anyTrend: Object.values(trendByCat).some((x) => x != null),
     };
-  }, [data, assumptions, startingBOM, months, planGroups, groupNames, typesByGroup, coverOverride, useTrend, monthCursor, dailySales]);
+  }, [data, assumptions, startingBOM, months, planGroups, groupNames, typesByGroup, coverOverride, useTrend, buyBy, monthCursor, dailySales]);
 
   // Month Pace: for the current real-world month (months[0]), compares actual sales/COGS-to-date
   // against where we'd expect to be given the forecast and how far through the calendar month we are.
@@ -1458,6 +1464,14 @@ function OTBEngine() {
               </button>
             ))}
           </div>
+          <div className="flex rounded overflow-hidden" style={{ border: "1px solid #DCD5C4" }}>
+            {[["group", "By planning group"], ["category", "By category"]].map(([k, lbl]) => (
+              <button key={k} onClick={() => setBuyBy(k)} className="text-xs px-3 py-1.5"
+                style={{ background: buyBy === k ? "#20232B" : "#FFFFFF", color: buyBy === k ? "#F1EEE6" : "#5C6270", fontWeight: buyBy === k ? 700 : 400 }}>
+                {lbl}
+              </button>
+            ))}
+          </div>
         </div>
 
         {buyView === "season" ? (
@@ -1466,7 +1480,7 @@ function OTBEngine() {
             <table style={{ borderCollapse: "collapse", fontFamily: "'IBM Plex Mono', monospace", width: "max-content", minWidth: "100%" }} className="text-xs sm:text-sm">
               <thead>
                 <tr style={{ background: "#20232B", color: "#EDE7DA" }}>
-                  <th className="text-left py-2 px-3" style={{ position: "sticky", left: 0, zIndex: 2, background: "#20232B", minWidth: 190 }}>Planning group</th>
+                  <th className="text-left py-2 px-3" style={{ position: "sticky", left: 0, zIndex: 2, background: "#20232B", minWidth: 190 }}>{buyBy === "category" ? "Category" : "Planning group"}</th>
                   {months.map((m, i) => (
                     <th key={m} className="text-right py-2 px-3" style={{ minWidth: 98, background: i === monthCursor ? "#C99A3C" : "#2A303B", color: i === monthCursor ? "#20232B" : "#EDE7DA" }}>{monthLabel(m)}</th>
                   ))}
@@ -1517,7 +1531,7 @@ function OTBEngine() {
           <table style={{ borderCollapse: "collapse", fontFamily: "'IBM Plex Mono', monospace", width: "100%" }} className="text-xs sm:text-sm">
             <thead>
               <tr style={{ background: "#20232B", color: "#EDE7DA" }}>
-                <th className="text-left py-2 px-3">Planning group</th>
+                <th className="text-left py-2 px-3">{buyBy === "category" ? "Category" : "Planning group"}</th>
                 <th className="text-right py-2 px-3">Selling vs plan</th>
                 <th className="text-right py-2 px-3">Cover</th>
                 <th className="text-right py-2 px-3">Already coming</th>
@@ -1572,7 +1586,7 @@ function OTBEngine() {
         <div className="mt-4 flex items-start gap-2 text-xs" style={{ color: "#8B8F98" }}>
           <Icon.info />
           <span>
-            Every figure is <b style={{ color: "#20232B" }}>at cost</b>. <b style={{ color: "#3F7A3F" }}>Green</b> is a buy: what this month needs on top of what is already on order, assuming you covered the earlier months — not a running total, so the columns do not double-count. <b style={{ color: "#B5432D" }}>Red</b> is the opposite, and it is a real number rather than a zero: how far past your cover target that group already sits. You cannot un-buy it, so it never becomes a negative buy — instead the surplus carries forward and shrinks the following month's need. Totals keep the two apart on purpose: an overbought group must never quietly fund another group's buy. <b style={{ color: "#20232B" }}>Cover</b> is how many weeks of forward sales you want to be holding; it comes from the WOS setting in Assumptions unless you type an override here. It is the single biggest lever on these numbers, which is what the strip below is for. <b style={{ color: "#20232B" }}>Selling vs plan</b> compares this month's actuals-to-date against what the plan expected by now, per category, capped at ±40%; groups with no synced actuals show “—” and stay on last year × growth, and the adjustment fades {Math.round(TREND_DECAY * 100)}% per month out because three weeks of one month says little about next spring. Expect the shortfall to move more than sales do — the cover target rises with the forecast while stock drains faster, so both sides widen at once. Months marked <span style={{ color: "#C99A3C" }}>†</span> take part of their cover from a window that wraps into next year, so that portion is estimated off a basis a year further back. Nothing here assumes anything about how long your vendors take.
+            Every figure is <b style={{ color: "#20232B" }}>at cost</b>. <b style={{ color: "#3F7A3F" }}>Green</b> is a buy: what this month needs on top of what is already on order, assuming you covered the earlier months — not a running total, so the columns do not double-count. <b style={{ color: "#B5432D" }}>Red</b> is the opposite, and it is a real number rather than a zero: how far past your cover target that group already sits. You cannot un-buy it, so it never becomes a negative buy — instead the surplus carries forward and shrinks the following month's need. Totals keep the two apart on purpose: an overbought group must never quietly fund another group's buy. <b style={{ color: "#20232B" }}>By category</b> matches how vendors and budgets are organised, but it nets less than <b style={{ color: "#20232B" }}>by planning group</b> — Fashion Tops and Tee/Tunic offset each other as one Tops group and cannot as two categories, which is worth about $22,000 over a year. <b style={{ color: "#20232B" }}>Cover</b> is how many weeks of forward sales you want to be holding; it comes from the WOS setting in Assumptions unless you type an override here. It is the single biggest lever on these numbers, which is what the strip below is for. <b style={{ color: "#20232B" }}>Selling vs plan</b> compares this month's actuals-to-date against what the plan expected by now, per category, capped at ±40%; groups with no synced actuals show “—” and stay on last year × growth, and the adjustment fades {Math.round(TREND_DECAY * 100)}% per month out because three weeks of one month says little about next spring. Expect the shortfall to move more than sales do — the cover target rises with the forecast while stock drains faster, so both sides widen at once. Months marked <span style={{ color: "#C99A3C" }}>†</span> take part of their cover from a window that wraps into next year, so that portion is estimated off a basis a year further back. Nothing here assumes anything about how long your vendors take.
           </span>
         </div>
       </div>
