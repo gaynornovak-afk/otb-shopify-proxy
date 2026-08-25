@@ -236,6 +236,7 @@ function OTBEngine() {
   const [showImport, setShowImport] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [growthSuggestions, setGrowthSuggestions] = useState({});
+  const [growthDraft, setGrowthDraft] = useState({});   // raw text per category while a Growth % box is being edited
   const [suggestionsStatus, setSuggestionsStatus] = useState("");
   const [calculatingSuggestions, setCalculatingSuggestions] = useState(false);
   const [showSync, setShowSync] = useState(false);
@@ -249,6 +250,11 @@ function OTBEngine() {
   // reads the same whether the group is genuinely covered or whether nothing is coming and
   // the opening stock is masking it. These flip the same grid to the three inputs behind it.
   const [boardRow, setBoardRow] = useState("buy");     // buy | coming | selling | cover
+  // Months you are not going to buy. The plan otherwise assumes every month's buy was
+  // written, so a month you skip silently vanishes instead of landing on the next one.
+  // Marking it here stops the roll-forward crediting stock you never bought, and the
+  // shortfall reappears - to the dollar - in the months that follow.
+  const [skippedMonths, setSkippedMonths] = useState([]);
   const [useTrend, setUseTrend] = useState(true);
   const [coverOverride, setCoverOverride] = useState("");   // blank = derive from lead time
   const [expandedPaceCat, setExpandedPaceCat] = useState(null);
@@ -288,6 +294,7 @@ function OTBEngine() {
           if (parsed.liveInventory) setLiveInventory({ ...parsed.liveInventory, loadedAt: parsed.liveInventory.loadedAt ? new Date(parsed.liveInventory.loadedAt) : new Date() });
           if (parsed.coverOverride !== undefined) setCoverOverride(parsed.coverOverride);
           if (parsed.useTrend !== undefined) setUseTrend(parsed.useTrend);
+          setSkippedMonths(parsed.skippedMonths || []);
           loadedFromServer = true;
         }
       } catch (e) { /* server unreachable or not configured yet - fall through to local copy below */ }
@@ -306,6 +313,7 @@ function OTBEngine() {
             if (parsed.liveInventory) setLiveInventory({ ...parsed.liveInventory, loadedAt: parsed.liveInventory.loadedAt ? new Date(parsed.liveInventory.loadedAt) : new Date() });
             if (parsed.coverOverride !== undefined) setCoverOverride(parsed.coverOverride);
             if (parsed.useTrend !== undefined) setUseTrend(parsed.useTrend);
+            setSkippedMonths(parsed.skippedMonths || []);
           }
         } catch (e2) { /* first run, nothing anywhere yet */ }
       }
@@ -317,7 +325,7 @@ function OTBEngine() {
     if (!loaded) return;
     setSaveState("saving");
     const t = setTimeout(async () => {
-      const payload = { assumptions, startingBOM, data, dailySales, planGroups, liveInventory, coverOverride, useTrend };
+      const payload = { assumptions, startingBOM, data, dailySales, planGroups, liveInventory, coverOverride, useTrend, skippedMonths };
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payload)); // always keep a local backup copy too
       } catch (e) { /* ignore quota errors */ }
@@ -327,7 +335,7 @@ function OTBEngine() {
       } catch (e) { setSaveState("saved locally only"); }
     }, 400);
     return () => clearTimeout(t);
-  }, [assumptions, startingBOM, data, dailySales, planGroups, liveInventory, coverOverride, useTrend, loaded]);
+  }, [assumptions, startingBOM, data, dailySales, planGroups, liveInventory, coverOverride, useTrend, skippedMonths, loaded]);
 
   function getAssumptions(cat) { return assumptions[cat] || defaultAssumptions(); }
   function setAssumption(cat, patch) { setAssumptions((prev) => ({ ...prev, [cat]: { ...getAssumptions(cat), ...patch } })); }
@@ -569,6 +577,7 @@ function OTBEngine() {
 
   const buyBoard = useMemo(() => {
     const WPM = 4.33;
+    const skipSet = new Set(skippedMonths);
     const curM = months[0];
     if (!curM || !months[monthCursor]) return null;
     const [cy, cm] = curM.split("-").map(Number);
@@ -654,8 +663,13 @@ function OTBEngine() {
         // Rolling `bom` on the floored buy is what carries a surplus into next month.
         const net = w.tot - before;
         const buy = Math.max(0, net);
-        bom = before + buy;
-        return { m, net, buy, cogs: fc[t], onOrder: onOrder[t], target: w.tot, short: w.wrapped };
+        // Roll forward on what you will ACTUALLY be holding. Normally that is the buy, because
+        // the plan assumes you wrote it. On a month marked skipped it is nothing - so the next
+        // month opens that much lighter and its shortfall grows by exactly what you did not
+        // spend, instead of the buy quietly disappearing off the front of the plan.
+        const skipped = skipSet.has(m);
+        bom = before + (skipped ? 0 : buy);
+        return { m, net, buy, cogs: fc[t], onOrder: onOrder[t], target: w.tot, short: w.wrapped, skipped };
       });
     }
 
@@ -704,7 +718,8 @@ function OTBEngine() {
       return { g, types, cover, trend, buy: s.buy, net: s.net, rawBuy: rawRow.buy, cogs: s.cogs, onOrder: s.onOrder,
                target: s.target, short: s.short, sens, growth: growthRead(types),
                allBuys: full.map((x) => x.buy), allNet: full.map((x) => x.net), allShort: full.map((x) => x.short),
-               allCogs: full.map((x) => x.cogs), allOnOrder: full.map((x) => x.onOrder) };
+               allCogs: full.map((x) => x.cogs), allOnOrder: full.map((x) => x.onOrder),
+               allSkipped: full.map((x) => x.skipped) };
     }).filter((r) => r.types.length);
 
     return {
@@ -714,10 +729,12 @@ function OTBEngine() {
       rawTotal: rows.reduce((a, r) => a + r.rawBuy, 0),
       mStr: months[idx],
       isPast: idx === 0 && isCur,
+      skippedBefore: months.slice(0, idx).filter((m) => skipSet.has(m)),
+      curSkipped: skipSet.has(months[idx]),
       paceRatio, weekdayMatched: dp.complete, daysElapsed, totalDays, storeTrend,
       anyTrend: Object.values(trendByCat).some((x) => x != null),
     };
-  }, [data, assumptions, startingBOM, months, planGroups, groupNames, typesByGroup, coverOverride, useTrend, buyBy, monthCursor, dailySales]);
+  }, [data, assumptions, startingBOM, months, planGroups, groupNames, typesByGroup, coverOverride, useTrend, buyBy, monthCursor, dailySales, skippedMonths]);
 
   // ---- 12-month grid: what each row mode shows -------------------------------
   // Same table, four different readings of the same month. The buy figure is the
@@ -1542,6 +1559,18 @@ function OTBEngine() {
             If any are dead, close them in your PO system and re-import.
           </div>
         )}
+        {buyBoard.skippedBefore.length > 0 && (
+          <div className="mb-3 px-3 py-2 rounded text-xs" style={{ background: "#F4F1EA", border: "1px solid #C4B79E", color: "#20232B" }}>
+            <b>{buyBoard.skippedBefore.map(monthLabel).join(", ")} marked as not bought.</b> The figures below have grown by exactly what you did not spend then —
+            skipping a month does not make the stock unnecessary, it just moves the shortfall onto the months after it.
+            {buyBoard.curSkipped && <span> {monthLabel(buyBoard.mStr)} is marked too, so this number will move onto {months[monthCursor + 1] ? monthLabel(months[monthCursor + 1]) : "next year"} as well.</span>}
+          </div>
+        )}
+        {buyBoard.skippedBefore.length === 0 && buyBoard.curSkipped && (
+          <div className="mb-3 px-3 py-2 rounded text-xs" style={{ background: "#F4F1EA", border: "1px solid #C4B79E", color: "#20232B" }}>
+            <b>{monthLabel(buyBoard.mStr)} is marked as not bought.</b> This is still what the month needs — it just moves onto {months[monthCursor + 1] ? monthLabel(months[monthCursor + 1]) : "next year"} rather than being written now.
+          </div>
+        )}
         <div className="flex flex-wrap items-center gap-4 mb-3">
           <label className="text-xs flex items-center gap-2" style={{ color: "#20232B" }}>
             <input type="checkbox" checked={useTrend} onChange={(e) => setUseTrend(e.target.checked)} />
@@ -1583,6 +1612,17 @@ function OTBEngine() {
           )}
         </div>
 
+        {buyView === "season" && (
+          <div className="text-[11px] mb-2" style={{ color: "#8B8F98" }}>
+            Click a month heading if you are not going to buy it — its shortfall moves onto the months after it instead of disappearing.
+            {skippedMonths.length > 0 && (
+              <span style={{ color: "#8C6E4A" }}> Not buying: <b>{skippedMonths.filter((m) => months.includes(m)).map(monthLabel).join(", ")}</b>.
+                <button onClick={() => setSkippedMonths([])} className="underline ml-1" style={{ color: "#8C6E4A" }}>clear</button>
+              </span>
+            )}
+          </div>
+        )}
+
         {buyView === "season" ? (
         <div style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }} className="rounded-md overflow-hidden">
           <div style={{ overflow: "auto" }}>
@@ -1590,9 +1630,19 @@ function OTBEngine() {
               <thead>
                 <tr style={{ background: "#20232B", color: "#EDE7DA" }}>
                   <th className="text-left py-2 px-3" style={{ position: "sticky", left: 0, zIndex: 2, background: "#20232B", minWidth: 190 }}>{buyBy === "category" ? "Category" : "Planning group"}</th>
-                  {months.map((m, i) => (
-                    <th key={m} className="text-right py-2 px-3" style={{ minWidth: 98, background: i === monthCursor ? "#C99A3C" : "#2A303B", color: i === monthCursor ? "#20232B" : "#EDE7DA" }}>{monthLabel(m)}</th>
-                  ))}
+                  {months.map((m, i) => {
+                    const sk = skippedMonths.includes(m);
+                    return (
+                      <th key={m} className="text-right py-2 px-3" title={sk ? "Marked not bought - click to undo" : "Click if you are not going to buy this month"}
+                        onClick={() => setSkippedMonths((prev) => prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m])}
+                        style={{ minWidth: 98, cursor: "pointer", userSelect: "none",
+                          background: sk ? "#5C4636" : i === monthCursor ? "#C99A3C" : "#2A303B",
+                          color: sk ? "#D8C9B4" : i === monthCursor ? "#20232B" : "#EDE7DA" }}>
+                        <span style={{ textDecoration: sk ? "line-through" : "none" }}>{monthLabel(m)}</span>
+                        {sk && <div style={{ fontSize: 9, fontWeight: 400, letterSpacing: 0.4 }}>NOT BUYING</div>}
+                      </th>
+                    );
+                  })}
                   <th className="text-right py-2 px-3" style={{ background: "#C99A3C", color: "#20232B", minWidth: 115 }}>{boardRow === "cover" ? "YEAR" : "SEASON"}</th>
                 </tr>
               </thead>
@@ -1618,9 +1668,12 @@ function OTBEngine() {
                     </td>
                     {months.map((m, i) => {
                       const c = boardCell(boardRow, r, i);
+                      const sk = boardRow === "buy" && r.allSkipped[i];
                       return (
                         <td key={i} className="text-right py-2 px-3"
-                          style={{ ...c.style, background: i === monthCursor ? "#FBF3E2" : (c.tint || "transparent") }}>
+                          style={{ ...c.style,
+                            ...(sk ? { color: "#B0B4BC", fontWeight: 400, textDecoration: "line-through" } : null),
+                            background: sk ? "#F4F1EA" : i === monthCursor ? "#FBF3E2" : (c.tint || "transparent") }}>
                           {c.text}{c.short ? <span style={{ color: "#C99A3C" }}> †</span> : null}
                         </td>
                       );
@@ -1739,7 +1792,7 @@ function OTBEngine() {
         <div className="mt-4 flex items-start gap-2 text-xs" style={{ color: "#8B8F98" }}>
           <Icon.info />
           <span>
-            Every figure is <b style={{ color: "#20232B" }}>at cost</b>. <b style={{ color: "#3F7A3F" }}>Green</b> is a buy: what this month needs on top of what is already on order, assuming you covered the earlier months — not a running total, so the columns do not double-count. <b style={{ color: "#B5432D" }}>Red</b> is the opposite, and it is a real number rather than a zero: how far past your cover target that group already sits. You cannot un-buy it, so it never becomes a negative buy — instead the surplus carries forward and shrinks the following month's need. Totals keep the two apart on purpose: an overbought group must never quietly fund another group's buy. <b style={{ color: "#20232B" }}>By category</b> matches how vendors and budgets are organised, but it nets less than <b style={{ color: "#20232B" }}>by planning group</b> — Fashion Tops and Tee/Tunic offset each other as one Tops group and cannot as two categories, which is worth about $22,000 over a year. <b style={{ color: "#20232B" }}>Cover</b> is how many weeks of forward sales you want to be holding; it comes from the WOS setting in Assumptions unless you type an override here. It is the single biggest lever on these numbers, which is what the strip below is for. <b style={{ color: "#20232B" }}>Growth: plan / running</b> is the check on the buy itself. The left figure is the growth you set in Assumptions; the right is the growth actually running against last year, measured on this month to date and pro-rated. When the right number is well above the left, the forecast under it is too low and the buy is a <i>floor</i> rather than an answer — the row is flagged green to say so. Well below, and the buy is overstated. This is a different question from Selling vs plan, which can look calm while the plan itself is far too small. On the 12-month grid the same two figures sit under every row name, and <b style={{ color: "#20232B" }}>Buy / Coming in / Selling / Cover</b> flips that grid between the answer and the three numbers behind it: what is scheduled to arrive, what the month sells at cost, and the ratio of the two. Cover there is the blunt monthly version — arriving ÷ selling — not the weeks-of-cover target; under 0.50× means little is landing against what the month has to sell, over 2.50× means far more is landing than it can. That is the number to hold against a delivery calendar, and it is where a $0 buy stops being ambiguous. <b style={{ color: "#20232B" }}>Selling vs plan</b> compares this month's actuals-to-date against what the plan expected by now, per category, capped at ±40%; groups with no synced actuals show “—” and stay on last year × growth, and the adjustment fades {Math.round(TREND_DECAY * 100)}% per month out because three weeks of one month says little about next spring. Expect the shortfall to move more than sales do — the cover target rises with the forecast while stock drains faster, so both sides widen at once. Months marked <span style={{ color: "#C99A3C" }}>†</span> take part of their cover from a window that wraps into next year, so that portion is estimated off a basis a year further back. Nothing here assumes anything about how long your vendors take.
+            Every figure is <b style={{ color: "#20232B" }}>at cost</b>. <b style={{ color: "#3F7A3F" }}>Green</b> is a buy: what this month needs on top of what is already on order, assuming you covered the earlier months — not a running total, so the columns do not double-count. <b style={{ color: "#B5432D" }}>Red</b> is the opposite, and it is a real number rather than a zero: how far past your cover target that group already sits. You cannot un-buy it, so it never becomes a negative buy — instead the surplus carries forward and shrinks the following month's need. Totals keep the two apart on purpose: an overbought group must never quietly fund another group's buy. <b style={{ color: "#20232B" }}>By category</b> matches how vendors and budgets are organised, but it nets less than <b style={{ color: "#20232B" }}>by planning group</b> — Fashion Tops and Tee/Tunic offset each other as one Tops group and cannot as two categories, which is worth about $22,000 over a year. <b style={{ color: "#20232B" }}>Cover</b> is how many weeks of forward sales you want to be holding; it comes from the WOS setting in Assumptions unless you type an override here. It is the single biggest lever on these numbers, which is what the strip below is for. <b style={{ color: "#20232B" }}>Growth: plan / running</b> is the check on the buy itself. The left figure is the growth you set in Assumptions; the right is the growth actually running against last year, measured on this month to date and pro-rated. When the right number is well above the left, the forecast under it is too low and the buy is a <i>floor</i> rather than an answer — the row is flagged green to say so. Well below, and the buy is overstated. This is a different question from Selling vs plan, which can look calm while the plan itself is far too small. On the 12-month grid the same two figures sit under every row name, and <b style={{ color: "#20232B" }}>Buy / Coming in / Selling / Cover</b> flips that grid between the answer and the three numbers behind it: what is scheduled to arrive, what the month sells at cost, and the ratio of the two. Cover there is the blunt monthly version — arriving ÷ selling — not the weeks-of-cover target; under 0.50× means little is landing against what the month has to sell, over 2.50× means far more is landing than it can. That is the number to hold against a delivery calendar, and it is where a $0 buy stops being ambiguous. <b style={{ color: "#20232B" }}>Selling vs plan</b> compares this month's actuals-to-date against what the plan expected by now, per category, capped at ±40%; groups with no synced actuals show “—” and stay on last year × growth, and the adjustment fades {Math.round(TREND_DECAY * 100)}% per month out because three weeks of one month says little about next spring. Expect the shortfall to move more than sales do — the cover target rises with the forecast while stock drains faster, so both sides widen at once. Months marked <span style={{ color: "#C99A3C" }}>†</span> take part of their cover from a window that wraps into next year, so that portion is estimated off a basis a year further back. <b style={{ color: "#20232B" }}>Not buying a month</b>: click a month heading on the 12-month grid. Every figure otherwise assumes you wrote the previous months' buys, so a month you skip is silently credited as stock you own — mark it and the plan rolls forward on nothing instead, which pushes the shortfall onto the following months to the dollar. It is a whole-month switch; buying part of a month is not modelled. Nothing here assumes anything about how long your vendors take.
           </span>
         </div>
       </div>
@@ -2203,7 +2256,20 @@ function OTBEngine() {
                 <div key={c} className="flex items-center gap-2 p-2 rounded border text-xs flex-wrap" style={{ borderColor: "#DCD5C4" }}>
                   <span style={{ width: 9, height: 9, borderRadius: 2, background: CATEGORY_COLOR[c], flexShrink: 0 }} />
                   <span className="flex-1 min-w-[140px]" style={{ fontWeight: 500 }}>{c}</span>
-                  <label className="flex items-center gap-1">Growth % <input type="number" value={a.growthPct} onChange={(e) => setAssumption(c, { growthPct: Number(e.target.value) })} className="w-14 border rounded px-1 py-1" style={{ borderColor: "#DCD5C4" }} /></label>
+                  {/* Deliberately type="text", not type="number". A number input reports an EMPTY
+                      value while its contents are mid-edit and invalid - which is exactly what a
+                      lone "-" is - so Number("") coerced to 0 and wrote 0 back on every keystroke,
+                      making a negative growth impossible to type. The draft keeps the raw string
+                      on screen and only commits once it parses. */}
+                  <label className="flex items-center gap-1">Growth % <input type="text" inputMode="text" value={growthDraft[c] !== undefined ? growthDraft[c] : a.growthPct}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setGrowthDraft((d) => ({ ...d, [c]: v }));
+                      const t = v.trim();
+                      if (t !== "" && t !== "-" && t !== "." && t !== "-." && Number.isFinite(Number(t))) setAssumption(c, { growthPct: Number(t) });
+                    }}
+                    onBlur={() => setGrowthDraft((d) => { const n = { ...d }; delete n[c]; return n; })}
+                    className="w-14 border rounded px-1 py-1" style={{ borderColor: "#DCD5C4" }} /></label>
                   {suggestion !== undefined && (
                     <button onClick={() => setAssumption(c, { growthPct: suggestion })} className="px-2 py-1 rounded text-[10px]" style={{ background: "#FBF6EA", color: "#8C6E4A", fontWeight: 600 }} title="Click to apply this suggestion">
                       Suggested: {suggestion > 0 ? "+" : ""}{suggestion}%
