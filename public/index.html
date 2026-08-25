@@ -894,7 +894,7 @@ function OTBEngine() {
     const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
     const monthOf = (dateStr) => { const s = (dateStr || "").trim(); return /^\d{4}-\d{2}/.test(s) ? s.slice(0, 7) : null; };
     const totals = {}; // type -> month -> { received, balance }
-    let matchedRows = 0, skippedRows = 0;
+    let matchedRows = 0, skippedRows = 0, overduePulled = 0, beyondHorizon = 0;
     importPreview.forEach((r) => {
       const typeName = (r["Product Type"] || "").trim();
       if (!typeName || !validTypes.has(typeName.toLowerCase())) { skippedRows++; return; }
@@ -903,14 +903,29 @@ function OTBEngine() {
       const received = Number(r["Total Cost Received"]) || 0;
       const balance = Math.max(0, ordered - received);
       const receivedMonth = monthOf(r["Received Date"]);
-      const expectedMonth = monthOf(r["Expected Date"]) || receivedMonth || months[monthCursor];
+      let expectedMonth = monthOf(r["Expected Date"]) || receivedMonth || months[monthCursor];
+      // An overdue PO is still stock you are waiting on. Once its expected date
+      // slips behind the plan's first month it lands on a month key nothing ever
+      // reads, and the money silently disappears from the plan - so pull it
+      // forward into the current month, where it can actually be seen and acted on.
+      // Receipts are left alone on purpose: anything received before the window
+      // is already sitting inside the starting BOM, and adding it again would
+      // double-count it.
+      if (expectedMonth < months[0]) {
+        overduePulled += balance;
+        expectedMonth = months[0];
+      } else if (expectedMonth > months[months.length - 1]) {
+        // Beyond the visible year - genuinely next year's plan, not this one's.
+        beyondHorizon += balance;
+        expectedMonth = null;
+      }
       matchedRows++;
       totals[match] = totals[match] || {};
       if (received > 0 && receivedMonth) {
         totals[match][receivedMonth] = totals[match][receivedMonth] || { received: 0, balance: 0 };
         totals[match][receivedMonth].received += received;
       }
-      if (balance > 0.005) {
+      if (balance > 0.005 && expectedMonth) {
         totals[match][expectedMonth] = totals[match][expectedMonth] || { received: 0, balance: 0 };
         totals[match][expectedMonth].balance += balance;
       }
@@ -934,6 +949,8 @@ function OTBEngine() {
       return next;
     });
     setImportSummary(`Applied ${matchedRows} line items across ${Object.keys(totals).length} product types (on-order replaced for those types).`
+      + (overduePulled > 0.005 ? ` ${money(overduePulled)} of overdue POs (expected before ${monthLabel(months[0])}) pulled forward into ${monthLabel(months[0])} - they had not arrived, so they are still inbound.` : "")
+      + (beyondHorizon > 0.005 ? ` ${money(beyondHorizon)} expected beyond ${monthLabel(months[months.length - 1])} is outside this plan year and excluded.` : "")
       + (skippedRows ? ` ⚠ Skipped ${skippedRows} row(s) whose Product Type didn't match the taxonomy - those POs are NOT counted as inbound.` : ""));
     setShowImport(false); setImportText(""); setImportPreview(null);
   }
