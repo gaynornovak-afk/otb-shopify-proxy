@@ -32,6 +32,9 @@ const Papa = window.Papa;
 const SWATCHES = ["#C99A3C", "#B5432D", "#5B7A5B", "#4A6280", "#7A5580", "#8C6E4A", "#5C8A8A", "#9C5B7A", "#6B7A3A", "#3A6B7A", "#8A6B3A", "#7A3A5B", "#4A5B7A"];
 const CATW = 128, TYPEW = 220;
 const STORAGE_KEY = "otb-engine-v4";
+// Bump on every deploy. Shown in the header so "is this the build I just pushed?"
+// is answerable at a glance instead of by hunting for a changed control.
+const APP_VERSION = "v14";
 
 const TAXONOMY = [
   ["1100 Fashion Tops", "1100 Fashion Tops"],
@@ -237,6 +240,11 @@ function OTBEngine() {
   const [showSettings, setShowSettings] = useState(false);
   const [growthSuggestions, setGrowthSuggestions] = useState({});
   const [growthDraft, setGrowthDraft] = useState({});   // raw text per category while a Growth % box is being edited
+  // PO import mode. Default ON: the export from the PO app is a complete one, and a complete
+  // export is the only thing that can clear a product type whose POs have ALL been received
+  // and closed - such a type stops appearing in the file entirely, so a per-type wipe can
+  // never reach it. Untick only when importing a partial file (one vendor, say).
+  const [poReplaceAll, setPoReplaceAll] = useState(true);
   const [suggestionsStatus, setSuggestionsStatus] = useState("");
   const [calculatingSuggestions, setCalculatingSuggestions] = useState(false);
   const [showSync, setShowSync] = useState(false);
@@ -1024,8 +1032,29 @@ function OTBEngine() {
         totals[match][expectedMonth].balance += balance;
       }
     });
+    // Types carrying on-order dollars that this file says nothing about. In complete-export mode
+    // they are stale by definition and get cleared; the count is reported either way, because
+    // "12 product types were holding stock that isn't coming" is worth seeing.
+    const stale = [];
+    TAXONOMY.forEach(([type]) => {
+      if (totals[type]) return;
+      const byMonth = data[type];
+      if (!byMonth) return;
+      const held = Object.values(byMonth).reduce((a, r) => a + num(r.received) + num(r.balanceToReceive), 0);
+      if (held > 0.005) stale.push(type);
+    });
     setData((prev) => {
       const next = { ...prev };
+      if (poReplaceAll) {
+        // Complete-export mode: clear on-order for EVERY product type first, not only the ones
+        // named in the file. Only these two fields are touched - LY sales, actuals and overrides
+        // are preserved.
+        Object.keys(next).forEach((type) => {
+          const td = { ...next[type] };
+          Object.keys(td).forEach((mKey) => { td[mKey] = { ...td[mKey], received: 0, balanceToReceive: 0 }; });
+          next[type] = td;
+        });
+      }
       Object.entries(totals).forEach(([type, byMonth]) => {
         const typeData = { ...(next[type] || {}) };
         // Wipe this type's on-order everywhere before rewriting it, so months that dropped out
@@ -1042,7 +1071,13 @@ function OTBEngine() {
       });
       return next;
     });
-    setImportSummary(`Applied ${matchedRows} line items across ${Object.keys(totals).length} product types (on-order replaced for those types).`
+    setImportSummary(`Applied ${matchedRows} line items across ${Object.keys(totals).length} product types`
+      + (poReplaceAll ? ", replacing all on-order across every product type." : " (on-order replaced for those types only).")
+      + (stale.length
+          ? (poReplaceAll
+              ? ` Cleared ${stale.length} product type(s) that were holding on-order but no longer appear in the export: ${stale.slice(0, 6).join(", ")}${stale.length > 6 ? ", …" : ""}.`
+              : ` ⚠ ${stale.length} product type(s) still hold on-order but are absent from this file: ${stale.slice(0, 6).join(", ")}${stale.length > 6 ? ", …" : ""}. If this was a complete export, those dollars are stale - re-import with "complete export" ticked.`)
+          : "")
       + (skippedRows ? ` ⚠ Skipped ${skippedRows} row(s) whose Product Type didn't match the taxonomy - those POs are NOT counted as inbound.` : ""));
     setShowImport(false); setImportText(""); setImportPreview(null);
   }
@@ -1431,7 +1466,7 @@ function OTBEngine() {
           <div>
             <div style={{ fontFamily: "'Roboto Slab', serif", color: "#F1EEE6" }} className="text-xl sm:text-2xl font-bold">OTB ENGINE</div>
             <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-xs mt-1">
-              category · product type · 12 months · {saveState === "saving" ? "saving…" : saveState === "saved" ? "saved (synced)" : saveState === "saved locally only" ? "saved on this device only - set up server storage to sync across devices" : ""}
+              <span style={{ color: "#8C6E4A", fontWeight: 600 }}>{APP_VERSION}</span> · category · product type · 12 months · {saveState === "saving" ? "saving…" : saveState === "saved" ? "saved (synced)" : saveState === "saved locally only" ? "saved on this device only - set up server storage to sync across devices" : ""}
             </div>
           </div>
           <div className="flex gap-2">
@@ -2345,6 +2380,15 @@ function OTBEngine() {
           {importError && <div className="text-xs mt-2" style={{ color: "#B5432D" }}>{importError}</div>}
           {importPreview && (
             <div className="mt-3 text-xs max-h-40 overflow-y-auto border rounded p-2" style={{ borderColor: "#DCD5C4" }}>
+              {importFormat === "po" && (
+                <label className="flex items-start gap-2 mb-2 p-2 rounded" style={{ background: "#FBF6EA", border: "1px solid #DCD5C4", color: "#20232B", fontWeight: 400 }}>
+                  <input type="checkbox" checked={poReplaceAll} onChange={(e) => setPoReplaceAll(e.target.checked)} className="mt-0.5" />
+                  <span>
+                    <b>This is a complete export</b> — wipe every product type's on-order and rewrite it from this file.
+                    <span style={{ color: "#8B8F98" }}> Leave this ticked for the usual full export. Untick it only for a partial file (one vendor), which can only correct the types it contains.</span>
+                  </span>
+                </label>
+              )}
               <div className="mb-1" style={{ color: "#8C6E4A", fontWeight: 600 }}>Detected format: {importFormat === "po" ? "PO/receiving export" : importFormat === "bom" ? "Starting BOM template" : importFormat === "dailySales" ? "Daily sales (by date)" : importFormat === "stock" ? "Current stock (Shopify product export)" : "Actuals/plan"} ({importPreview.length} rows)</div>
               {importPreview.slice(0, 8).map((r, i) => (
                 <div key={i} style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
