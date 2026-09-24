@@ -4,6 +4,7 @@
 
 
 
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -34,7 +35,73 @@ const CATW = 128, TYPEW = 220;
 const STORAGE_KEY = "otb-engine-v4";
 // Bump on every deploy. Shown in the header so "is this the build I just pushed?"
 // is answerable at a glance instead of by hunting for a changed control.
-const APP_VERSION = "v14";
+const APP_VERSION = "v15";
+
+// The five CSV formats the Import dialog accepts. Each import is now CHOSEN by name before a
+// file is loaded, not guessed afterwards: the chooser sets importLock, and parseAndPreview
+// refuses anything whose headers say it is a different format. Auto-detection still runs - it
+// is what the lock is checked against - but it can no longer silently route a file somewhere
+// the merchant did not intend (which is how a variant-level stock file once landed in the
+// Starting BOM and overwrote a month's opening inventory).
+const IMPORT_KINDS = {
+  stock: {
+    label: "Current Inventory",
+    blurb: "On-hand stock, one row per variant. Drives Weeks of Stock on Month Pace.",
+    needs: "A product/inventory export with a product type, an on-hand quantity and a unit cost — one row per variant. Hextom's export and Shopify's own product export are both understood; you do not need to rename anything.",
+    note: "Re-importing replaces the whole stock snapshot.",
+  },
+  bom: {
+    label: "Starting BOM",
+    blurb: "Opening inventory $ for the month, one row per product type.",
+    needs: "Planning Category, Shopify Product Type, Plan Month, Beginning Inv $",
+    note: "Sets each product type's Starting Actual BOM $. Run once at the start of each month.",
+  },
+  po: {
+    label: "PO / Receiving",
+    blurb: "On-order and received dollars by month, from the PO Export app.",
+    needs: "Product Type, Expected Date, Received Date, Total Cost Ordered, Total Cost Received",
+    note: "Auto-fills Received $ and Balance to Receive $ by month.",
+  },
+  dailySales: {
+    label: "Daily Sales (last year)",
+    blurb: "Last year's store-wide sales by date. Not this year — that is the Sync button.",
+    needs: "A Day/Date column plus a Net Sales column, store-wide (not per product type) — e.g. Shopify's \"Sales over time\" report.",
+    note: "Powers Month Pace's weekday-matched Expected-to-date. Import last year's full month at minimum; re-importing is safe, existing dates are overwritten.",
+  },
+  generic: {
+    label: "Actuals / Plan",
+    blurb: "LY sales and COGS, and manual actuals, per product type per month.",
+    needs: "Product Type, Month, LY Sales, LY COGS, Actual Sales, Actual COGS, Received, Balance to Receive",
+    note: "Only the columns present in the file are written; the rest are left alone.",
+  },
+};
+
+// Stock exports spell the same three columns several different ways. Hextom writes
+// "Product type" / "Variant available inventory number at <location>" / "Variant cost";
+// Shopify's own product export writes "Type" / "Variant Inventory Qty" / "Cost per item".
+// v14 looked for the literal string "Type" and nothing else, so a Hextom export matched zero
+// rows and failed silently. Both detection and application now go through this one function so
+// the two can never drift apart again.
+function findStockCols(cols) {
+  const find = (...res) => cols.find((c) => res.some((re) => re.test(String(c).trim())));
+  return {
+    typeCol: find(/^type$/i, /^product type$/i, /^product_type$/i),
+    qtyCol: find(/^variant inventory qty$/i, /variant available inventory number/i, /^variant available$/i, /^inventory qty$/i, /^on hand$/i),
+    costCol: find(/^cost per item$/i, /^variant cost$/i, /^unit cost$/i),
+    handleCol: find(/^handle$/i, /^product handle$/i),
+  };
+}
+
+// Returns the format a file's headers say it is, independent of what the merchant asked for.
+function detectFormat(cols) {
+  if (cols.some((c) => c.toLowerCase().includes("shopify product type")) && cols.some((c) => c.toLowerCase().includes("beginning inv"))) return "bom";
+  if (cols.includes("Product Type") && cols.includes("Total Cost Ordered") && cols.includes("Total Cost Received")) return "po";
+  if (!cols.includes("Product Type") && cols.some((c) => /^(day|date)$/i.test(c.trim())) && cols.some((c) => /sales/i.test(c))) return "dailySales";
+  const sc = findStockCols(cols);
+  if (sc.typeCol && sc.qtyCol && sc.costCol) return "stock";
+  if (cols.includes("Product Type") && cols.includes("Month")) return "generic";
+  return null;
+}
 
 const TAXONOMY = [
   ["1100 Fashion Tops", "1100 Fashion Tops"],
@@ -159,6 +226,9 @@ function monthKey(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).pad
 function monthLabel(key) { const [y, m] = key.split("-").map(Number); return new Date(y, m - 1, 1).toLocaleDateString("en-US", { month: "short", year: "2-digit" }); }
 function next12Months() { const out = []; const now = new Date(); now.setDate(1); for (let i = 0; i < 12; i++) { const d = new Date(now.getFullYear(), now.getMonth() + i, 1); out.push(monthKey(d)); } return out; }
 function money(n) { if (n === null || n === undefined) return "—"; const v = Number(n) || 0; return v.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }); }
+// To-the-cent version, used in import confirmations so a total can be checked against the
+// source file exactly rather than "about right".
+function moneyExact(n) { const v = Number(n) || 0; return v.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
 function num(v) { return v === "" || v === undefined || v === null ? 0 : Number(v); }
 function emptyRow() {
   return { lySales: 0, lyCogs: 0, actualSales: "", actualCogs: "", received: 0, balanceToReceive: 0, targetBOMOverride: "", actualBOMOverride: "" };
@@ -245,6 +315,7 @@ function OTBEngine() {
   // and closed - such a type stops appearing in the file entirely, so a per-type wipe can
   // never reach it. Untick only when importing a partial file (one vendor, say).
   const [poReplaceAll, setPoReplaceAll] = useState(true);
+  const [bomReplaceAll, setBomReplaceAll] = useState(true);
   const [suggestionsStatus, setSuggestionsStatus] = useState("");
   const [calculatingSuggestions, setCalculatingSuggestions] = useState(false);
   const [showSync, setShowSync] = useState(false);
@@ -282,7 +353,9 @@ function OTBEngine() {
   const [importPreview, setImportPreview] = useState(null);
   const [importError, setImportError] = useState("");
   const [importFormat, setImportFormat] = useState("generic");
+  const [importLock, setImportLock] = useState(null); // the format the merchant chose by name; null = chooser screen
   const [importSummary, setImportSummary] = useState("");
+  const [importSummaryTone, setImportSummaryTone] = useState("ok"); // "ok" | "warn"
   const fileInputRef = useRef(null);
   const visibleMonths = 6;
 
@@ -913,44 +986,45 @@ function OTBEngine() {
   const expandedSeries = expandedType ? seriesByType[expandedType] : null;
   const chartData = expandedSeries ? expandedSeries.map((s) => ({ month: monthLabel(s.mKey), value: Math.round(s.overUnder) })) : [];
 
-  function parseAndPreview(text) {
+  function parseAndPreview(text, lockOverride) {
     setImportError("");
+    const lock = lockOverride !== undefined ? lockOverride : importLock;
     Papa.parse(text.trim(), {
       header: true, skipEmptyLines: true,
       complete: (res) => {
         const cols = res.meta.fields || [];
-        const isBOMFormat = cols.some((c) => c.toLowerCase().includes("shopify product type")) && cols.some((c) => c.toLowerCase().includes("beginning inv"));
-        if (isBOMFormat) {
-          setImportFormat("bom");
-          setImportPreview(res.data.slice(0, 5000));
+        const detected = detectFormat(cols);
+        if (!lock) { // no format chosen yet - shouldn't happen via the chooser, but stay safe
+          if (!detected) { setImportError("Could not tell what kind of file this is from its column headers."); setImportPreview(null); return; }
+          setImportFormat(detected);
+          setImportPreview(res.data.slice(0, detected === "stock" ? 60000 : 5000));
           return;
         }
-        const isPOFormat = cols.includes("Product Type") && cols.includes("Total Cost Ordered") && cols.includes("Total Cost Received");
-        if (isPOFormat) {
-          setImportFormat("po");
-          setImportPreview(res.data.slice(0, 5000));
+        if (detected !== lock) {
+          const wanted = IMPORT_KINDS[lock];
+          const got = detected ? IMPORT_KINDS[detected].label : null;
+          setImportError(
+            got
+              ? `This looks like a ${got} file, but you chose ${wanted.label}. Nothing has been imported. Either pick ${got} instead, or load your ${wanted.label} file.`
+              : `This doesn't match the ${wanted.label} format and nothing has been imported. Expected: ${wanted.needs}. Found: ${cols.slice(0, 8).join(", ")}${cols.length > 8 ? ", …" : ""}.`
+          );
+          setImportPreview(null);
           return;
         }
-        const isDailySalesFormat = !cols.includes("Product Type") && cols.some((c) => /^(day|date)$/i.test(c.trim())) && cols.some((c) => /sales/i.test(c));
-        if (isDailySalesFormat) {
-          setImportFormat("dailySales");
-          setImportPreview(res.data.slice(0, 5000));
-          return;
-        }
-        const isStockFormat = cols.includes("Type") && cols.some((c) => /variant inventory qty/i.test(c)) && cols.some((c) => /cost per item/i.test(c));
-        if (isStockFormat) {
-          setImportFormat("stock");
-          setImportPreview(res.data.slice(0, 60000));
-          return;
-        }
-        setImportFormat("generic");
-        const required = ["Product Type", "Month"];
-        const missing = required.filter((r) => !cols.includes(r));
-        if (missing.length) { setImportError(`Missing required column(s): ${missing.join(", ")}. (For a PO/receiving export, include "Total Cost Ordered" and "Total Cost Received" columns instead.)`); setImportPreview(null); return; }
-        setImportPreview(res.data.slice(0, 2000));
+        setImportFormat(lock);
+        setImportPreview(res.data.slice(0, lock === "stock" ? 60000 : 5000));
       },
       error: (err) => { setImportError("Could not parse that CSV: " + err.message); setImportPreview(null); },
     });
+  }
+  function openImport(kind) {
+    setImportLock(kind);
+    setImportFormat(kind || "generic");
+    setImportText("");
+    setImportPreview(null);
+    setImportError("");
+    setImportSummary("");
+    setShowImport(true);
   }
   const MONTH_NAMES = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
   function parseMonthToKey(raw) {
@@ -995,7 +1069,7 @@ function OTBEngine() {
       });
       return next;
     });
-    setShowImport(false); setImportText(""); setImportPreview(null);
+    setImportText(""); setImportPreview(null); // dialog stays open so the result is actually read
   }
   // Aggregates a line-item PO/receiving export (Product Type, Expected Date, Received Date,
   // Total Cost Ordered, Total Cost Received) into Received $ / Balance to Receive $ per
@@ -1079,7 +1153,7 @@ function OTBEngine() {
               : ` ⚠ ${stale.length} product type(s) still hold on-order but are absent from this file: ${stale.slice(0, 6).join(", ")}${stale.length > 6 ? ", …" : ""}. If this was a complete export, those dollars are stale - re-import with "complete export" ticked.`)
           : "")
       + (skippedRows ? ` ⚠ Skipped ${skippedRows} row(s) whose Product Type didn't match the taxonomy - those POs are NOT counted as inbound.` : ""));
-    setShowImport(false); setImportText(""); setImportPreview(null);
+    setImportText(""); setImportPreview(null); // dialog stays open so the result is actually read
   }
   // Applies a "Beginning Inv $" / starting BOM template (Planning Category, Shopify Product
   // Type, Plan Month, Beginning Inv $) as each product type's Starting Actual BOM $.
@@ -1097,9 +1171,20 @@ function OTBEngine() {
       updates[match] = val;
       matched++;
     });
-    setStartingBOM((prev) => ({ ...prev, ...updates }));
-    setImportSummary(`Set starting BOM for ${matched} product types.`);
-    setShowImport(false); setImportText(""); setImportPreview(null);
+    // A full BOM export lists every product type holding stock; anything absent holds none. So
+    // the default is to REPLACE - types missing from the file are zeroed rather than left at
+    // whatever a previous import put there. Without this, a bad import's stray rows survive
+    // every subsequent correct one, because a merge can only overwrite keys the new file names.
+    if (bomReplaceAll) setStartingBOM(updates);
+    else setStartingBOM((prev) => ({ ...prev, ...updates }));
+    const total = Object.values(updates).reduce((s, v) => s + v, 0);
+    const dropped = bomReplaceAll ? Object.keys(startingBOM || {}).filter((k) => !(k in updates) && Number(startingBOM[k]) > 0).length : 0;
+    setImportSummaryTone("ok");
+    setImportSummary(
+      `Set starting BOM for ${matched} product type${matched === 1 ? "" : "s"}, totalling ${moneyExact(total)}.`
+      + (dropped ? ` ${dropped} type(s) not in this file were cleared to $0.` : "")
+    );
+    setImportText(""); setImportPreview(null); // dialog stays open so the result is actually read
   }
   // Parses dates like "Jul 1, 2026", "2026-07-01", "07/01/2026" into an ISO "YYYY-MM-DD" string.
   // Store-wide daily net sales, used to build a real (not flat-assumed) pacing curve for Month
@@ -1133,7 +1218,7 @@ function OTBEngine() {
     });
     setDailySales((prev) => ({ ...prev, ...updates }));
     setImportSummary(`Imported daily sales for ${matched} day(s)${skipped ? `, skipped ${skipped} row(s) that didn't parse` : ""}.`);
-    setShowImport(false); setImportText(""); setImportPreview(null);
+    setImportText(""); setImportPreview(null); // dialog stays open so the result is actually read
   }
   // Aggregates Shopify's native product export (one row per variant) into inventory value per
   // Product Type, feeding straight into the same liveInventory shape the live "Check current
@@ -1143,33 +1228,58 @@ function OTBEngine() {
   function applyStockImport() {
     const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
     const cols = Object.keys(importPreview[0] || {});
-    const typeCol = "Type";
-    const qtyCol = cols.find((c) => /variant inventory qty/i.test(c));
-    const costCol = cols.find((c) => /cost per item/i.test(c));
-    const handleCol = cols.find((c) => /^handle$/i.test(c));
-    if (!qtyCol || !costCol) { setImportError("Could not find Variant Inventory Qty and Cost per item columns in this file."); return; }
+    const { typeCol, qtyCol, costCol, handleCol } = findStockCols(cols);
+    if (!typeCol || !qtyCol || !costCol) {
+      setImportError(`Could not find the product type, quantity and unit cost columns in this file. Found: ${cols.slice(0, 8).join(", ")}${cols.length > 8 ? ", …" : ""}.`);
+      return;
+    }
     const totals = {};
-    let lastType = "";
+    // Forward-fill a blank type from the product's FIRST row only - reset per Handle, so a
+    // variant can never inherit the type of an unrelated product, and only remember types that
+    // are actually in the taxonomy so junk can't propagate either.
+    let lastHandle = null, lastType = "";
     let matched = 0, skipped = 0, variantCount = 0;
+    const unmatched = new Map(); // unrecognised type value -> how many rows carried it
+    let negativeUnits = 0;
     importPreview.forEach((r) => {
-      const handleVal = handleCol ? r[handleCol] : null;
-      let typeName = (r[typeCol] || "").trim();
-      if (!typeName && lastType) typeName = lastType; // forward-fill from the product's first row
-      if (typeName) lastType = typeName;
-      const qty = Number(r[qtyCol]);
-      if (isNaN(qty)) { skipped++; return; } // blank qty = a non-variant summary row in some exports; skip quietly
+      const handleVal = handleCol ? String(r[handleCol] ?? "").trim() : null;
+      if (handleCol && handleVal !== lastHandle) { lastHandle = handleVal; lastType = ""; }
+      let typeName = String(r[typeCol] ?? "").trim();
+      if (!typeName && lastType) typeName = lastType;
+      if (typeName && validTypes.has(typeName.toLowerCase())) lastType = typeName;
+      const qty = Number(String(r[qtyCol] ?? "").replace(/[^0-9.\-]/g, ""));
+      if (isNaN(qty) || String(r[qtyCol] ?? "").trim() === "") { skipped++; return; } // non-variant summary row
       variantCount++;
-      if (!typeName || !validTypes.has(typeName.toLowerCase())) { skipped++; return; }
+      if (!typeName || !validTypes.has(typeName.toLowerCase())) {
+        skipped++;
+        const key = typeName || "(blank)";
+        unmatched.set(key, (unmatched.get(key) || 0) + 1);
+        return;
+      }
       const match = TAXONOMY.find((t) => t[0].toLowerCase() === typeName.toLowerCase())[0];
       const cost = Number(String(r[costCol] ?? "").replace(/[^0-9.\-]/g, "")) || 0;
+      // An untracked or oversold variant can report a negative on-hand. Counting it would
+      // subtract stock the shop does not have from a type that does, so clamp at zero and say so.
+      const useQty = qty < 0 ? 0 : qty;
+      if (qty < 0) negativeUnits += 1;
       if (!totals[match]) totals[match] = { units: 0, value: 0 };
-      totals[match].units += qty;
-      totals[match].value += qty * cost;
+      totals[match].units += useQty;
+      totals[match].value += useQty * cost;
       matched++;
     });
+    const typeCount = Object.keys(totals).length;
     setLiveInventory({ totals, loadedAt: new Date(), truncated: false, variantsScanned: variantCount, source: "import" });
-    setImportSummary(`Imported current stock from ${variantCount} variant row(s), matched ${matched} to a Product Type${skipped ? `, skipped ${skipped}` : ""}.`);
-    setShowImport(false); setImportText(""); setImportPreview(null);
+    const totalUnits = Object.values(totals).reduce((s, t) => s + t.units, 0);
+    const totalValue = Object.values(totals).reduce((s, t) => s + t.value, 0);
+    const bits = [`${matched} of ${variantCount} rows matched, across ${typeCount} product type${typeCount === 1 ? "" : "s"} — ${totalUnits.toLocaleString()} units, ${moneyExact(totalValue)} at cost.`];
+    if (negativeUnits) bits.push(`${negativeUnits} negative on-hand row(s) counted as zero.`);
+    if (unmatched.size) {
+      const list = [...unmatched.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([k, n]) => `${k} (${n})`);
+      bits.push(`Unrecognised product type${unmatched.size === 1 ? "" : "s"}: ${list.join(", ")}${unmatched.size > 10 ? `, and ${unmatched.size - 10} more` : ""}.`);
+    }
+    setImportSummaryTone(skipped ? "warn" : "ok");
+    setImportSummary(bits.join(" "));
+    setImportText(""); setImportPreview(null); // dialog stays open so the result is actually read
   }
   function handleFileUpload(e) {
     const file = e.target.files?.[0];
@@ -1488,7 +1598,7 @@ function OTBEngine() {
             <button onClick={() => { setViewMode("group"); setShowGroups(true); }} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
               <Icon.sliders /> Groups
             </button>
-            <button onClick={() => setShowImport(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
+            <button onClick={() => openImport(null)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
               <Icon.upload /> Import
             </button>
             <button onClick={exportCSV} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
@@ -1840,13 +1950,13 @@ function OTBEngine() {
             : ` Expected-to-date is currently a flat estimate (forecast ÷ days, prorated evenly) - Shopify's live API only reaches back ~60 days, too short for a year-ago comparison, so the more accurate weekday-matched version needs daily sales imported via CSV for LY's full ${monthLabel(`${monthPace.dailyPace.monthStart.slice(0,7)}`)} (has ${monthPace.dailyPace.monthDaysFound} of ${monthPace.dailyPace.monthDaysTotal} days so far).`}
         </p>
         <div className="flex flex-wrap items-center gap-3 mb-3">
-          <button onClick={() => { setShowImport(true); setImportFormat("dailySales"); }} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5" style={{ background: "#20232B", color: "#F1EEE6" }}>
+          <button onClick={() => openImport("dailySales")} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5" style={{ background: "#20232B", color: "#F1EEE6" }}>
             <Icon.upload /> Import daily sales
           </button>
           {!monthPace.usingWeekdayMatch && (monthPace.dailyPace.windowDaysFound > 0 || monthPace.dailyPace.monthDaysFound > 0) && (
             <span className="text-xs" style={{ color: "#8C6E4A" }}>Partial data loaded: {monthPace.dailyPace.monthDaysFound}/{monthPace.dailyPace.monthDaysTotal} days of LY month, {monthPace.dailyPace.windowDaysFound}/{monthPace.dailyPace.windowDaysTotal} of the comparison window.</span>
           )}
-          <button onClick={() => { setShowImport(true); setImportFormat("stock"); }} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5" style={{ background: "#20232B", color: "#F1EEE6" }}>
+          <button onClick={() => openImport("stock")} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5" style={{ background: "#20232B", color: "#F1EEE6" }}>
             <Icon.upload /> Import current stock (CSV)
           </button>
           {liveInventory && (
@@ -2352,24 +2462,29 @@ function OTBEngine() {
       )}
 
       {showImport && (
-        <Modal onClose={() => { setShowImport(false); setImportPreview(null); setImportError(""); }} title="Import from CSV">
-          <p className="text-sm mb-2" style={{ color: "#5C6270" }}>Formats are auto-detected from the column headers:</p>
-          <div className="text-xs mb-2 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
-            <b>Actuals/plan:</b> Product Type, Month, LY Sales, LY COGS, Actual Sales, Actual COGS, Received, Balance to Receive
+        <Modal onClose={() => { setShowImport(false); setImportPreview(null); setImportError(""); setImportLock(null); }} title={importLock ? `Import — ${IMPORT_KINDS[importLock].label}` : "Import from CSV"}>
+          {!importLock ? (
+            <>
+              <p className="text-sm mb-3" style={{ color: "#5C6270" }}>Which file are you importing? Pick one — the app will check your file matches before it changes anything.</p>
+              <div className="flex flex-col gap-2 mb-1">
+                {["stock", "bom", "po", "dailySales", "generic"].map((k) => (
+                  <button key={k} onClick={() => openImport(k)} className="text-left px-3 py-2 rounded" style={{ background: "#F1EEE6", border: "1px solid #DCD5C4" }}>
+                    <div className="text-sm flex items-center gap-1.5" style={{ color: "#20232B", fontWeight: 600 }}><Icon.upload /> {IMPORT_KINDS[k].label}</div>
+                    <div className="text-xs mt-0.5" style={{ color: "#5C6270" }}>{IMPORT_KINDS[k].blurb}</div>
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : (
+          <>
+          <div className="flex items-center justify-between mb-2">
+            <button onClick={() => { setImportLock(null); setImportPreview(null); setImportError(""); setImportText(""); }} className="text-xs px-2 py-1 rounded" style={{ background: "#E6E1D6", color: "#20232B" }}>← All import types</button>
           </div>
-          <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
-            <b>PO/receiving export</b> (e.g. from your "PO Export" Sidekick app): Product Type, Expected Date, Received Date, Total Cost Ordered, Total Cost Received — this one auto-fills Received $ and Balance to Receive $ by month.
+          <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6" }}>
+            <div style={{ fontFamily: "'IBM Plex Mono', monospace" }}><b>Needs:</b> {IMPORT_KINDS[importLock].needs}</div>
+            <div className="mt-1" style={{ color: "#5C6270" }}>{IMPORT_KINDS[importLock].note}</div>
           </div>
-          <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
-            <b>Starting BOM template:</b> Planning Category, Shopify Product Type, Plan Month, Beginning Inv $ — sets each product type's Starting Actual BOM $.
-          </div>
-          <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
-            <b>Daily sales (by date):</b> a Day/Date column plus a Net Sales column, store-wide (not per Product Type) — e.g. Shopify's own "Sales over time" report exported to CSV. Powers Month Pace's weekday-matched Expected-to-date, since Shopify's live API can't reach back a year on its own. Import LY's full month at minimum; safe to re-import/add more dates any time, existing dates just get overwritten.
-          </div>
-          <div className="text-xs mb-3 p-2 rounded" style={{ background: "#F1EEE6", fontFamily: "'IBM Plex Mono', monospace" }}>
-            <b>Current stock:</b> Shopify's own product export (Products → Export → CSV) — uses its Type, Variant Inventory Qty, and Cost per item columns. Powers Month Pace's Weeks of Stock column. Note: if your store tracks inventory at more than one location, Shopify leaves Variant Inventory Qty out of this export - you'll need to merge in a separate Inventory export (Products → Inventory → Export, filtered to your real location) yourself first. Re-importing replaces the whole stock snapshot.
-          </div>
-          {importSummary && <div className="text-xs mb-3 p-2 rounded" style={{ background: "#EDF3EA", color: "#5B7A5B" }}>{importSummary}</div>}
+          {importSummary && <div className="text-xs mb-3 p-2 rounded" style={importSummaryTone === "warn" ? { background: "#FAEDE9", color: "#B5432D" } : { background: "#EDF3EA", color: "#5B7A5B" }}>{importSummary}</div>}
           <div className="flex gap-2 mb-3">
             <button onClick={() => fileInputRef.current?.click()} className="text-xs px-3 py-1.5 rounded flex items-center gap-1" style={{ background: "#20232B", color: "#F1EEE6" }}>
               <Icon.upload /> Upload CSV file
@@ -2389,7 +2504,16 @@ function OTBEngine() {
                   </span>
                 </label>
               )}
-              <div className="mb-1" style={{ color: "#8C6E4A", fontWeight: 600 }}>Detected format: {importFormat === "po" ? "PO/receiving export" : importFormat === "bom" ? "Starting BOM template" : importFormat === "dailySales" ? "Daily sales (by date)" : importFormat === "stock" ? "Current stock (Shopify product export)" : "Actuals/plan"} ({importPreview.length} rows)</div>
+              {importFormat === "bom" && (
+                <label className="flex items-start gap-2 mb-2 p-2 rounded" style={{ background: "#FBF6EA", border: "1px solid #DCD5C4", color: "#20232B", fontWeight: 400 }}>
+                  <input type="checkbox" checked={bomReplaceAll} onChange={(e) => setBomReplaceAll(e.target.checked)} className="mt-0.5" />
+                  <span>
+                    <b>This is the complete BOM for the month</b> — clear every product type first, then set them from this file.
+                    <span style={{ color: "#8B8F98" }}> Leave this ticked for the usual Access export. Untick it only to patch a few types, which leaves every other type exactly as it is.</span>
+                  </span>
+                </label>
+              )}
+              <div className="mb-1" style={{ color: "#5B7A5B", fontWeight: 600 }}>✓ Matches {IMPORT_KINDS[importFormat] ? IMPORT_KINDS[importFormat].label : importFormat} ({importPreview.length.toLocaleString()} rows)</div>
               {importPreview.slice(0, 8).map((r, i) => (
                 <div key={i} style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
                   {importFormat === "po"
@@ -2399,7 +2523,7 @@ function OTBEngine() {
                     : importFormat === "dailySales"
                     ? `${r[Object.keys(r).find((c) => /^(day|date)$/i.test(c.trim()))]} · ${r[Object.keys(r).find((c) => /sales/i.test(c))]}`
                     : importFormat === "stock"
-                    ? `${r["Type"] || "(blank - forward-filled)"} · qty ${r[Object.keys(r).find((c) => /variant inventory qty/i.test(c))]} · cost ${r[Object.keys(r).find((c) => /cost per item/i.test(c))]}`
+                    ? (() => { const sc = findStockCols(Object.keys(r)); return `${r[sc.typeCol] || "(blank - forward-filled)"} · qty ${r[sc.qtyCol]} · cost ${r[sc.costCol]}`; })()
                     : `${r["Product Type"]} · ${r["Month"]} · LY Sales ${r["LY Sales"] ?? "—"} · LY COGS ${r["LY COGS"] ?? "—"}`}
                 </div>
               ))}
@@ -2407,11 +2531,13 @@ function OTBEngine() {
             </div>
           )}
           <div className="flex justify-end gap-2 mt-4">
-            <button onClick={() => setShowImport(false)} className="text-xs px-3 py-2 rounded" style={{ background: "#E6E1D6" }}>Cancel</button>
+            <button onClick={() => { setShowImport(false); setImportLock(null); setImportSummary(""); }} className="text-xs px-3 py-2 rounded" style={{ background: "#E6E1D6" }}>Close</button>
             <button onClick={applyImport} disabled={!importPreview} className="text-xs px-3 py-2 rounded flex items-center gap-1 disabled:opacity-40" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 600 }}>
-              <Icon.check /> Apply import
+              <Icon.check /> Apply {IMPORT_KINDS[importLock] ? IMPORT_KINDS[importLock].label : "import"}
             </button>
           </div>
+          </>
+          )}
         </Modal>
       )}
     </div>
