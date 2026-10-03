@@ -203,7 +203,7 @@ orderLines.forEach((line) => {
                       node {
                         quantity
                         subtotalSet { shopMoney { amount } }
-                        lineItem { isGiftCard product { productType } }
+                        lineItem { isGiftCard product { productType } variant { inventoryItem { unitCost { amount } } } }
                       }
                     }
                   }
@@ -224,7 +224,10 @@ orderLines.forEach((line) => {
               if (rli.lineItem?.isGiftCard) return;
               const type = rli.lineItem?.product?.productType;
               const refundAmt = parseFloat(rli.subtotalSet.shopMoney.amount || 0);
-              addTotal(type, -refundAmt, 0);
+              // A returned item gives its cost back too - leaving COGS in place made any week
+              // or month with returns read as a margin collapse.
+              const refundCost = parseFloat(rli.lineItem?.variant?.inventoryItem?.unitCost?.amount || 0) * rli.quantity;
+              addTotal(type, -refundAmt, -refundCost);
             });
           });
         });
@@ -281,7 +284,7 @@ app.get("/vendor-report", async (req, res) => {
             edges {
               cursor
               node {
-                currentSubtotalPriceSet { shopMoney { amount } }
+                subtotalPriceSet { shopMoney { amount } }
                 lineItems(first: 100) {
                   edges {
                     node {
@@ -305,22 +308,26 @@ app.get("/vendor-report", async (req, res) => {
         data.orders.edges.forEach(({ node, cursor: c }) => {
           cursor = c;
           const orderLines = [];
-          let lineItemSum = 0;
+          let lineItemSum = 0, lineItemSumAll = 0;
           node.lineItems.edges.forEach(({ node: li }) => {
+            const sales = parseFloat(li.discountedTotalSet.shopMoney.amount || 0);
+            lineItemSumAll += sales;
             if (li.isGiftCard) return;
             const type = li.product?.productType;
             const vendor = li.vendor;
-            const sales = parseFloat(li.discountedTotalSet.shopMoney.amount || 0);
             const unitCost = parseFloat(li.variant?.inventoryItem?.unitCost?.amount || 0);
             const cogs = unitCost * li.quantity;
             lineItemSum += sales;
             orderLines.push({ type, vendor, sales, cogs });
           });
-          const orderSubtotal = parseFloat(node.currentSubtotalPriceSet?.shopMoney?.amount ?? lineItemSum);
-          const extraDiscount = lineItemSum - orderSubtotal;
+          // Same reconciliation as /sales-by-type: the ORIGINAL subtotal (currentSubtotal already
+          // has refunds taken out, which pass 2 subtracts again), compared against every line
+          // including gift cards, spread in either direction.
+          const orderSubtotal = parseFloat(node.subtotalPriceSet?.shopMoney?.amount ?? lineItemSumAll);
+          const extraDiscount = lineItemSumAll - orderSubtotal;
           orderLines.forEach((line) => {
             let adjustedSales = line.sales;
-            if (extraDiscount > 0.01 && lineItemSum > 0) {
+            if (Math.abs(extraDiscount) > 0.01 && lineItemSum > 0) {
               adjustedSales -= extraDiscount * (line.sales / lineItemSum);
             }
             addVendor(line.vendor, line.type, adjustedSales, line.cogs);
@@ -349,7 +356,7 @@ app.get("/vendor-report", async (req, res) => {
                       node {
                         quantity
                         subtotalSet { shopMoney { amount } }
-                        lineItem { isGiftCard vendor product { productType } }
+                        lineItem { isGiftCard vendor product { productType } variant { inventoryItem { unitCost { amount } } } }
                       }
                     }
                   }
@@ -371,7 +378,8 @@ app.get("/vendor-report", async (req, res) => {
               const type = rli.lineItem?.product?.productType;
               const vendor = rli.lineItem?.vendor;
               const refundAmt = parseFloat(rli.subtotalSet.shopMoney.amount || 0);
-              addVendor(vendor, type, -refundAmt, 0);
+              const refundCost = parseFloat(rli.lineItem?.variant?.inventoryItem?.unitCost?.amount || 0) * rli.quantity;
+              addVendor(vendor, type, -refundAmt, -refundCost);
             });
           });
         });
@@ -441,6 +449,178 @@ app.get("/inventory-by-type", async (req, res) => {
       pages++;
     }
     res.json({ totals, truncated: hasNextPage, pagesScanned: pages, variantsScanned });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// ===== Weekly Owner Dashboard ==============================================
+// GET /week-summary?start=2026-09-21&end=2026-09-27
+// Everything the dashboard needs for one span of days, in ONE pass over the orders:
+//   totals  - gross, discounts, returns, net, orders, units, cogs
+//   days    - the same per local calendar day (so Mon-Sun weeks and week-to-date line up)
+//   byType  - { "1101 ...": { net, units, cogs } }
+//   byVendor- { "Vendor": { net, units, cogs } }
+// Definitions follow /sales-by-type exactly (gift cards excluded, order-level discounts such as
+// loyalty redemptions spread across the lines, returns dated by when the refund happened), with
+// two differences: returned items also give back their COST, so a week with returns does not
+// read as a margin collapse; and days are cut in the SHOP's time zone, not UTC.
+// Shopify only lets this app see roughly the last 60 days of orders - older weeks come from the
+// imported files instead, and the dashboard says which it is using.
+let SHOP_TZ = null;
+async function shopTimeZone() {
+  if (SHOP_TZ) return SHOP_TZ;
+  try {
+    const d = await shopifyGraphQL(`{ shop { ianaTimezone } }`, {});
+    SHOP_TZ = d.shop.ianaTimezone || "America/Regina";
+  } catch (e) { SHOP_TZ = "America/Regina"; }
+  return SHOP_TZ;
+}
+// Local calendar date (YYYY-MM-DD) of a UTC timestamp in the given zone.
+function localDate(iso, tz) {
+  const p = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(iso));
+  const g = (t) => p.find((x) => x.type === t).value;
+  return `${g("year")}-${g("month")}-${g("day")}`;
+}
+// UTC instant at which a local calendar day begins.
+function localDayStartUTC(ymd, tz) {
+  const [y, m, d] = ymd.split("-").map(Number);
+  let guess = Date.UTC(y, m - 1, d);
+  for (let i = 0; i < 3; i++) {
+    const p = new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).formatToParts(new Date(guess));
+    const g = (t) => Number(p.find((x) => x.type === t).value);
+    const asIfUTC = Date.UTC(g("year"), g("month") - 1, g("day"), g("hour"), g("minute"));
+    guess -= asIfUTC - Date.UTC(y, m - 1, d);
+  }
+  return new Date(guess).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+function addDaysYMD(ymd, n) {
+  const [y, m, d] = ymd.split("-").map(Number);
+  const t = new Date(Date.UTC(y, m - 1, d + n));
+  return t.toISOString().slice(0, 10);
+}
+
+app.get("/week-summary", async (req, res) => {
+  const { start, end } = req.query;
+  if (!start || !end) return res.status(400).json({ error: "start and end (YYYY-MM-DD) are required" });
+  const tz = await shopTimeZone();
+  const fromUTC = localDayStartUTC(start, tz);
+  const toUTC = localDayStartUTC(addDaysYMD(end, 1), tz); // exclusive
+
+  const blank = () => ({ gross: 0, discounts: 0, returns: 0, net: 0, orders: 0, units: 0, cogs: 0 });
+  const totals = blank();
+  const days = {};
+  for (let d = start; d <= end; d = addDaysYMD(d, 1)) days[d] = blank();
+  const byType = {}, byVendor = {};
+  function dim(map, key) { if (!map[key]) map[key] = { net: 0, units: 0, cogs: 0 }; return map[key]; }
+  function add(day, field, v) { totals[field] += v; if (days[day]) days[day][field] += v; }
+
+  const MAX_PAGES = 40;
+  let truncated = false;
+  try {
+    // Pass 1: sales - orders CREATED in the window
+    {
+      const searchQuery = `created_at:>='${fromUTC}' AND created_at:<'${toUTC}' AND -status:cancelled`;
+      let cursor = null, hasNextPage = true, pages = 0;
+      const query = `
+        query($cursor: String, $searchQuery: String!) {
+          orders(first: 50, after: $cursor, query: $searchQuery) {
+            edges { cursor node {
+              createdAt
+              subtotalPriceSet { shopMoney { amount } }
+              lineItems(first: 100) { edges { node {
+                quantity isGiftCard vendor
+                originalTotalSet { shopMoney { amount } }
+                discountedTotalSet { shopMoney { amount } }
+                product { productType }
+                variant { inventoryItem { unitCost { amount } } }
+              } } }
+            } }
+            pageInfo { hasNextPage }
+          }
+        }`;
+      while (hasNextPage && pages < MAX_PAGES) {
+        const data = await shopifyGraphQL(query, { cursor, searchQuery });
+        data.orders.edges.forEach(({ node, cursor: c }) => {
+          cursor = c;
+          const day = localDate(node.createdAt, tz);
+          const lines = [];
+          let lineSum = 0, lineSumAll = 0;
+          node.lineItems.edges.forEach(({ node: li }) => {
+            const sales = parseFloat(li.discountedTotalSet.shopMoney.amount || 0);
+            lineSumAll += sales;
+            if (li.isGiftCard) return;
+            const unitCost = parseFloat(li.variant?.inventoryItem?.unitCost?.amount || 0);
+            lineSum += sales;
+            lines.push({ type: li.product?.productType || "9999 Unclassified", vendor: li.vendor || "(No vendor set)", qty: li.quantity,
+                         gross: parseFloat(li.originalTotalSet?.shopMoney?.amount || 0), sales, cogs: unitCost * li.quantity });
+          });
+          if (!lines.length) return; // gift-card-only order: not a merchandise transaction
+          const subtotal = parseFloat(node.subtotalPriceSet?.shopMoney?.amount ?? lineSumAll);
+          const extra = lineSumAll - subtotal;
+          add(day, "orders", 1);
+          lines.forEach((l) => {
+            let net = l.sales;
+            if (Math.abs(extra) > 0.01 && lineSum > 0) net -= extra * (l.sales / lineSum);
+            add(day, "gross", l.gross);
+            add(day, "discounts", l.gross - net);
+            add(day, "net", net);
+            add(day, "units", l.qty);
+            add(day, "cogs", l.cogs);
+            const t = dim(byType, l.type); t.net += net; t.units += l.qty; t.cogs += l.cogs;
+            const v = dim(byVendor, l.vendor); v.net += net; v.units += l.qty; v.cogs += l.cogs;
+          });
+        });
+        hasNextPage = data.orders.pageInfo.hasNextPage;
+        pages++;
+      }
+      if (hasNextPage) truncated = true;
+    }
+    // Pass 2: returns - refunds whose own date falls in the window. No upper bound on updated_at:
+    // an order refunded in the window and touched again afterwards must still be found.
+    {
+      const searchQuery = `updated_at:>='${fromUTC}' AND -status:cancelled`;
+      let cursor = null, hasNextPage = true, pages = 0;
+      const query = `
+        query($cursor: String, $searchQuery: String!) {
+          orders(first: 50, after: $cursor, query: $searchQuery) {
+            edges { cursor node {
+              refunds { createdAt refundLineItems(first: 100) { edges { node {
+                quantity
+                subtotalSet { shopMoney { amount } }
+                lineItem { isGiftCard vendor product { productType } variant { inventoryItem { unitCost { amount } } } }
+              } } } }
+            } }
+            pageInfo { hasNextPage }
+          }
+        }`;
+      while (hasNextPage && pages < MAX_PAGES) {
+        const data = await shopifyGraphQL(query, { cursor, searchQuery });
+        data.orders.edges.forEach(({ node, cursor: c }) => {
+          cursor = c;
+          node.refunds.forEach((refund) => {
+            if (!refund.createdAt || refund.createdAt < fromUTC || refund.createdAt >= toUTC) return;
+            const day = localDate(refund.createdAt, tz);
+            refund.refundLineItems.edges.forEach(({ node: r }) => {
+              if (r.lineItem?.isGiftCard) return;
+              const amt = parseFloat(r.subtotalSet.shopMoney.amount || 0);
+              const cost = parseFloat(r.lineItem?.variant?.inventoryItem?.unitCost?.amount || 0) * r.quantity;
+              add(day, "returns", amt);
+              add(day, "net", -amt);
+              add(day, "units", -r.quantity);
+              add(day, "cogs", -cost);
+              const t = dim(byType, r.lineItem?.product?.productType || "9999 Unclassified"); t.net -= amt; t.units -= r.quantity; t.cogs -= cost;
+              const v = dim(byVendor, r.lineItem?.vendor || "(No vendor set)"); v.net -= amt; v.units -= r.quantity; v.cogs -= cost;
+            });
+          });
+        });
+        hasNextPage = data.orders.pageInfo.hasNextPage;
+        pages++;
+      }
+      if (hasNextPage) truncated = true;
+    }
+    res.json({ start, end, tz, totals, days, byType, byVendor, truncated });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: String(err.message || err) });
