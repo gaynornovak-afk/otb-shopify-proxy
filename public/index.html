@@ -1,3 +1,10 @@
+
+
+
+
+
+
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -28,7 +35,7 @@ const CATW = 128, TYPEW = 220;
 const STORAGE_KEY = "otb-engine-v4";
 // Bump on every deploy. Shown in the header so "is this the build I just pushed?"
 // is answerable at a glance instead of by hunting for a changed control.
-const APP_VERSION = "v16";
+const APP_VERSION = "v16.1";
 
 // The five CSV formats the Import dialog accepts. Each import is now CHOSEN by name before a
 // file is loaded, not guessed afterwards: the chooser sets importLock, and parseAndPreview
@@ -67,6 +74,12 @@ const IMPORT_KINDS = {
     needs: "A Day/Date column, a Product type and/or Product vendor column, and Net sales. Net items sold and Cost of goods sold (or Gross profit) are used when present — e.g. a Shopify report grouped by Day and Product type.",
     note: "Rolled up into Monday–Sunday weeks on import. Any week the file touches is replaced for that split, so export whole weeks.",
   },
+  payroll: {
+    label: "Payroll (pay period)",
+    blurb: "One pay period's payroll register. Feeds payroll % on the Owner Dashboard.",
+    needs: "One row per person with Gross income and Employer taxes columns — the payroll summary export. Choose the pay period's last day (a Sunday) and its length below.",
+    note: "Payroll cost = gross pay + employer taxes. Only the period total is saved — no names or individual pay. Re-importing the same period replaces it.",
+  },
   generic: {
     label: "Actuals / Plan",
     blurb: "LY sales and COGS, and manual actuals, per product type per month.",
@@ -95,6 +108,7 @@ function findStockCols(cols) {
 
 // Returns the format a file's headers say it is, independent of what the merchant asked for.
 function detectFormat(cols) {
+  if (cols.some((c) => /^gross (income|pay)$/i.test(String(c).trim())) && cols.some((c) => /^employer taxes$/i.test(String(c).trim()))) return "payroll";
   if (cols.some((c) => c.toLowerCase().includes("shopify product type")) && cols.some((c) => c.toLowerCase().includes("beginning inv"))) return "bom";
   if (cols.includes("Product Type") && cols.includes("Total Cost Ordered") && cols.includes("Total Cost Received")) return "po";
   const hasDay = cols.some((c) => /^(day|date)$/i.test(String(c).trim()));
@@ -328,9 +342,12 @@ function OTBEngine() {
   const [showDashboard, setShowDashboard] = useState(false);
   // Owner Dashboard data, kept in one key so nothing the buy engine reads is touched:
   // dailyDetail {date: {net, gross, discounts, returns, orders, units, cogs}}, weeklyByType /
-  // weeklyByVendor {monday: {days, rows, src}}, invHistory [...], poByVendor, payroll {monday: $},
+  // weeklyByVendor {monday: {days, rows, src}}, invHistory [...], poByVendor,
+  // payPeriods {endSunday: {start, end, cost, gross, employerTax, people, src}} (1- or 2-week periods),
   // settings (alert thresholds), lyOverrides {monday: LY monday}.
   const [dash, setDash] = useState({});
+  const [payEnd, setPayEnd] = useState("");   // payroll import: last day (Sunday) of the pay period
+  const [payWeeks, setPayWeeks] = useState(2); // payroll import: period length in weeks
   // --- Buy Board -------------------------------------------------------------
   const [showBuyBoard, setShowBuyBoard] = useState(false);
   const [buyView, setBuyView] = useState("month");     // "month" = one month in detail, "season" = all 12
@@ -1082,6 +1099,7 @@ function OTBEngine() {
     if (importFormat === "dailySales") { applyDailySalesImport(); return; }
     if (importFormat === "stock") { applyStockImport(); return; }
     if (importFormat === "salesBy") { applySalesByImport(); return; }
+    if (importFormat === "payroll") { applyPayrollImport(); return; }
     const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
     setData((prev) => {
       const next = { ...prev };
@@ -1325,19 +1343,69 @@ function OTBEngine() {
     });
     const round = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, { net: Math.round(v.net * 100) / 100, units: Math.round(v.units * 100) / 100, cogs: Math.round(v.cogs * 100) / 100 }]));
     const weeks = Object.keys(datesByWeek).sort();
+    // Shopify leaves days with no sales out of a split report entirely (closed Sundays and
+    // Mondays), so counting dates in the file under-counts every week. A day missing from the file
+    // counts as covered when the store-wide daily sales show it had no sales and no orders.
+    const dd = dash.dailyDetail || {};
+    const coveredDays = (wk) => {
+      let n = 0;
+      for (let i = 0; i < 7; i++) {
+        const [y, m, d] = wk.split("-").map(Number); const dt = new Date(y, m - 1, d + i);
+        const iso = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+        if (datesByWeek[wk].has(iso)) { n++; continue; }
+        const day = dd[iso];
+        const quiet = day && Math.abs(day.net || 0) < 0.01 && !(day.orders > 0);
+        if (quiet) n++;
+      }
+      return n;
+    };
+    const weekDays = Object.fromEntries(weeks.map((wk) => [wk, coveredDays(wk)]));
     setDash((prev) => {
       const next = { ...prev };
-      if (typeCol) { const w = { ...(prev.weeklyByType || {}) }; weeks.forEach((wk) => { w[wk] = { days: datesByWeek[wk].size, rows: round(byType[wk] || {}), src: "import", cogs: !!(cogsCol || gpCol), units: !!unitsCol }; }); next.weeklyByType = w; }
-      if (vendorCol) { const w = { ...(prev.weeklyByVendor || {}) }; weeks.forEach((wk) => { w[wk] = { days: datesByWeek[wk].size, rows: round(byVendor[wk] || {}), src: "import", cogs: !!(cogsCol || gpCol), units: !!unitsCol }; }); next.weeklyByVendor = w; }
+      if (typeCol) { const w = { ...(prev.weeklyByType || {}) }; weeks.forEach((wk) => { w[wk] = { days: weekDays[wk], rows: round(byType[wk] || {}), src: "import", cogs: !!(cogsCol || gpCol), units: !!unitsCol }; }); next.weeklyByType = w; }
+      if (vendorCol) { const w = { ...(prev.weeklyByVendor || {}) }; weeks.forEach((wk) => { w[wk] = { days: weekDays[wk], rows: round(byVendor[wk] || {}), src: "import", cogs: !!(cogsCol || gpCol), units: !!unitsCol }; }); next.weeklyByVendor = w; }
       return next;
     });
-    const partial = weeks.filter((wk) => datesByWeek[wk].size < 7);
+    const partial = weeks.filter((wk) => weekDays[wk] < 7);
     setImportSummaryTone(partial.length || !(cogsCol || gpCol) || !unitsCol ? "warn" : "ok");
     setImportSummary(`Imported ${rows.toLocaleString()} rows into ${weeks.length} week(s)${weeks.length ? `, ${weeks[0]} to ${weeks[weeks.length - 1]}` : ""}, split by ${[typeCol && "product type", vendorCol && "vendor"].filter(Boolean).join(" and ")}.`
       + (skipped ? ` Skipped ${skipped} row(s) with no readable date.` : "")
-      + (partial.length ? ` ${partial.length} week(s) at the edges of the file are incomplete (${partial.slice(0, 3).join(", ")}${partial.length > 3 ? ", …" : ""}) and won't be used for comparisons — re-export from a Monday to a Sunday to fill them.` : "")
+      + (partial.length ? ` ${partial.length} week(s) are incomplete (${partial.slice(0, 3).join(", ")}${partial.length > 3 ? ", …" : ""}) and won't be used for comparisons. Either the file doesn't cover the whole Monday–Sunday week, or those days are missing from your Daily Sales import too — import Daily Sales for the same dates first, then this file again.` : "")
       + (!unitsCol ? " No units column." : "")
       + (!(cogsCol || gpCol) ? " No cost column, so margin by category/vendor last year isn't available." : ""));
+    setImportText(""); setImportPreview(null);
+  }
+  // One pay period's register -> a single total. Names and individual pay are read only to be
+  // summed; nothing per person is kept, because /state is readable by anyone with the URL.
+  function applyPayrollImport() {
+    const cols = Object.keys(importPreview[0] || {});
+    const grossCol = cols.find((c) => /^gross (income|pay)$/i.test(c.trim()));
+    const erCol = cols.find((c) => /^employer taxes$/i.test(c.trim()));
+    const nameCol = cols[0];
+    if (!payEnd) { setImportError("Choose the last day of the pay period first."); return; }
+    const [y, m, d] = payEnd.split("-").map(Number);
+    const endDate = new Date(y, m - 1, d);
+    if (endDate.getDay() !== 0) { setImportError("The pay period's last day should be a Sunday — payroll runs Monday to Sunday."); return; }
+    const toNum = (v) => Number(String(v ?? "").replace(/[^0-9.\-]/g, "")) || 0;
+    let gross = 0, er = 0, people = 0;
+    importPreview.forEach((r) => {
+      if (/^total/i.test(String(r[nameCol] || "").trim())) return; // a totals row would double-count
+      const g = toNum(r[grossCol]);
+      gross += g; er += Math.abs(toNum(r[erCol]));
+      if (g > 0) people++;
+    });
+    const startDate = new Date(endDate); startDate.setDate(endDate.getDate() - (7 * payWeeks - 1));
+    const ymd = (dt) => `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+    const start = ymd(startDate);
+    const entry = { start, end: payEnd, cost: Math.round((gross + er) * 100) / 100, gross: Math.round(gross * 100) / 100, employerTax: Math.round(er * 100) / 100, people, src: "import" };
+    setDash((prev) => {
+      // A new period replaces any saved period it overlaps.
+      const pp = Object.fromEntries(Object.entries(prev.payPeriods || {}).filter(([, p]) => p.end < start || p.start > payEnd));
+      pp[payEnd] = entry;
+      return { ...prev, payPeriods: pp };
+    });
+    setImportSummaryTone("ok");
+    setImportSummary(`Pay period ${start} to ${payEnd} (${payWeeks} week${payWeeks === 1 ? "" : "s"}): ${people} people, gross pay ${moneyExact(gross)} + employer taxes ${moneyExact(er)} = payroll cost ${moneyExact(gross + er)}. Only the total was saved.`);
     setImportText(""); setImportPreview(null);
   }
   // Aggregates Shopify's native product export (one row per variant) into inventory value per
@@ -1437,6 +1505,9 @@ function OTBEngine() {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
+    // Payroll exports carry the period end in the file name (payroll-2026-09-27.csv) and nowhere else.
+    const fm = (file.name || "").match(/(\d{4}-\d{2}-\d{2})/);
+    if (fm && importLock === "payroll") setPayEnd(fm[1]);
     reader.onload = (ev) => { const text = ev.target.result; setImportText(text); parseAndPreview(text); };
     reader.readAsText(file);
   }
@@ -2628,7 +2699,7 @@ function OTBEngine() {
             <>
               <p className="text-sm mb-3" style={{ color: "#5C6270" }}>Which file are you importing? Pick one — the app will check your file matches before it changes anything.</p>
               <div className="flex flex-col gap-2 mb-1">
-                {["stock", "bom", "po", "dailySales", "salesBy", "generic"].map((k) => (
+                {["stock", "bom", "po", "dailySales", "salesBy", "payroll", "generic"].map((k) => (
                   <button key={k} onClick={() => openImport(k)} className="text-left px-3 py-2 rounded" style={{ background: "#F1EEE6", border: "1px solid #DCD5C4" }}>
                     <div className="text-sm flex items-center gap-1.5" style={{ color: "#20232B", fontWeight: 600 }}><Icon.upload /> {IMPORT_KINDS[k].label}</div>
                     <div className="text-xs mt-0.5" style={{ color: "#5C6270" }}>{IMPORT_KINDS[k].blurb}</div>
@@ -2645,6 +2716,18 @@ function OTBEngine() {
             <div style={{ fontFamily: "'IBM Plex Mono', monospace" }}><b>Needs:</b> {IMPORT_KINDS[importLock].needs}</div>
             <div className="mt-1" style={{ color: "#5C6270" }}>{IMPORT_KINDS[importLock].note}</div>
           </div>
+          {importLock === "payroll" && (
+            <div className="text-xs mb-3 flex flex-wrap items-center gap-3">
+              <label className="flex items-center gap-1.5">Pay period ends (Sunday)
+                <input type="date" value={payEnd} onChange={(e) => setPayEnd(e.target.value)} className="border rounded px-1 py-0.5" style={{ borderColor: "#DCD5C4" }} />
+              </label>
+              <label className="flex items-center gap-1.5">Covers
+                <select value={payWeeks} onChange={(e) => setPayWeeks(Number(e.target.value))} className="border rounded px-1 py-0.5" style={{ borderColor: "#DCD5C4" }}>
+                  <option value={2}>2 weeks</option><option value={1}>1 week</option>
+                </select>
+              </label>
+            </div>
+          )}
           {importSummary && <div className="text-xs mb-3 p-2 rounded" style={importSummaryTone === "warn" ? { background: "#FAEDE9", color: "#B5432D" } : { background: "#EDF3EA", color: "#5B7A5B" }}>{importSummary}</div>}
           <div className="flex gap-2 mb-3">
             <button onClick={() => fileInputRef.current?.click()} className="text-xs px-3 py-1.5 rounded flex items-center gap-1" style={{ background: "#20232B", color: "#F1EEE6" }}>
@@ -2683,6 +2766,8 @@ function OTBEngine() {
                     ? `${r[Object.keys(r).find((c) => c.toLowerCase().includes("shopify product type"))]} · ${r[Object.keys(r).find((c) => c.toLowerCase().includes("beginning inv"))]}`
                     : importFormat === "dailySales"
                     ? `${r[Object.keys(r).find((c) => /^(day|date)$/i.test(c.trim()))]} · ${r[Object.keys(r).find((c) => /^net sales$/i.test(c.trim())) || Object.keys(r).find((c) => /sales/i.test(c))]}`
+                    : importFormat === "payroll"
+                    ? (() => { const g = Object.keys(r).find((c) => /^gross (income|pay)$/i.test(c.trim())); const e = Object.keys(r).find((c) => /^employer taxes$/i.test(c.trim())); return `gross ${r[g]} · employer taxes ${r[e]}`; })()
                     : importFormat === "salesBy"
                     ? Object.keys(r).filter((c) => /^(day|date|product type|product vendor|vendor|net sales)$/i.test(c.trim())).map((c) => r[c]).join(" · ")
                     : importFormat === "stock"
@@ -2899,6 +2984,7 @@ function OwnerDashboard({ dash, setDash, dailySales, liveInventory, dashGroups, 
   const [vendorAll, setVendorAll] = useState(false);
   const [showAllAlerts, setShowAllAlerts] = useState(false);
   const [lyEdit, setLyEdit] = useState(false);
+  const [payDraft, setPayDraft] = useState({ end: "", weeks: 2, cost: "" });
   const settings = { ...DASH_DEFAULTS, ...(dash.settings || {}) };
 
   const isWTD = weekStart === curMon;
@@ -2972,7 +3058,21 @@ function OwnerDashboard({ dash, setDash, dailySales, liveInventory, dashGroups, 
     });
   }
   function setSetting(k, v) { setDash((p) => ({ ...p, settings: { ...(p.settings || {}), [k]: v === "" ? undefined : Number(v) } })); }
-  function setPayroll(v) { setDash((p) => { const pr = { ...(p.payroll || {}) }; if (v === "") delete pr[weekStart]; else pr[weekStart] = Number(v); return { ...p, payroll: pr }; }); }
+  // Pay periods are saved by their last day. A period replaces any saved period it overlaps.
+  function savePeriod(end, weeks, cost, extra) {
+    const start = dAdd(end, -(7 * weeks - 1));
+    setDash((p) => {
+      const pp = Object.fromEntries(Object.entries(p.payPeriods || {}).filter(([, x]) => x.end < start || x.start > end));
+      pp[end] = { start, end, cost: Math.round(Number(cost) * 100) / 100, src: "manual", ...(extra || {}) };
+      return { ...p, payPeriods: pp };
+    });
+  }
+  function editPeriodCost(per, v) {
+    setDash((p) => ({ ...p, payPeriods: { ...(p.payPeriods || {}), [per.end]: { ...per, cost: v === "" ? 0 : Number(v), src: "manual" } } }));
+  }
+  function deletePeriod(per) {
+    setDash((p) => { const pp = { ...(p.payPeriods || {}) }; delete pp[per.end]; return { ...p, payPeriods: pp }; });
+  }
   function setLyOverride(v) { setDash((p) => { const o = { ...(p.lyOverrides || {}) }; if (!v) delete o[weekStart]; else o[weekStart] = dMonday(v); return { ...p, lyOverrides: o }; }); }
 
   // ---------- this week ----------
@@ -3089,9 +3189,23 @@ function OwnerDashboard({ dash, setDash, dailySales, liveInventory, dashGroups, 
   const ahead = (G[0] ? G[0].ahead : []).map((x, i) => ({ m: x.m, amt: G.reduce((a, g) => a + (g.ahead[i]?.amt || 0), 0) }));
 
   // ---------- payroll ----------
-  const payroll = (dash.payroll || {})[weekStart];
-  const payPct = payroll !== undefined && ty.t.net > 0 ? (payroll / ty.t.net) * 100 : null;
+  // Payroll is judged over its own pay period (one or two Monday-Sunday weeks) against the sales of
+  // exactly those days. A single week inside a two-week period never carries the colour on its own:
+  // split evenly, a slow-sales week would read high and a strong one low, and neither means anything.
+  const weekSun = dAdd(weekStart, 6);
+  const periods = Object.values(dash.payPeriods || {}).sort((a, b) => (a.end < b.end ? -1 : 1));
+  const per = periods.find((x) => x.start <= weekStart && weekSun <= x.end) || null;
+  // Where a new period would fall: continue the rhythm of the latest saved one, else 2 weeks ending this Sunday.
+  const lastPer = periods[periods.length - 1];
+  const perLen = lastPer ? Math.max(1, Math.round((dDiff(lastPer.start, lastPer.end) + 1) / 7)) : 2;
+  const suggestEnd = lastPer ? dAdd(lastPer.end, 7 * perLen * Math.ceil(dDiff(lastPer.end, weekSun) / (7 * perLen))) : weekSun;
+  const perDone = per ? per.end < today : false;
+  const perDays = per ? (perDone ? dDiff(per.start, per.end) + 1 : Math.max(0, dDiff(per.start, today) + 1)) : 0;
+  const perSales = per && perDays ? sumDays(tyDay, per.start, perDays) : null;
+  const payroll = per ? per.cost : undefined;
+  const payPct = per && perSales && perSales.complete && perSales.net > 0 ? (per.cost / perSales.net) * 100 : null;
   const payTone = payPct === null ? INK : payPct <= settings.payrollTarget ? GOOD : payPct <= settings.payrollWarn ? WARN : BAD;
+  const perWeeks = per ? Math.round((dDiff(per.start, per.end) + 1) / 7) : 0;
 
   // ---------- needs attention ----------
   const alerts = [];
@@ -3107,8 +3221,8 @@ function OwnerDashboard({ dash, setDash, dailySales, liveInventory, dashGroups, 
   const gmDrop = tyR.gm !== null && gmBase !== null ? gmBase - tyR.gm : null;
   if (gmDrop !== null && gmDrop >= settings.gmWarn && ty.t.net >= settings.minSales)
     A(gmDrop >= settings.gmBad ? "red" : "yellow", `Margin ${fmtPct(tyR.gm)}, down ${gmDrop.toFixed(1)} pts`, `Against ${fmtPct(gmBase)} ${lyOK && lyR.gm !== null ? "the same week last year" : "planned (GM % assumptions, weighted by this week's sales)"}.`);
-  if (payPct !== null && !isWTD && payPct > settings.payrollTarget)
-    A(payPct > settings.payrollWarn ? "red" : "yellow", `Payroll ${fmtPct(payPct)} of sales`, `${money(payroll)} on ${money(ty.t.net)} of sales; target is ${settings.payrollTarget}% or less.`);
+  if (payPct !== null && perDone && payPct > settings.payrollTarget)
+    A(payPct > settings.payrollWarn ? "red" : "yellow", `Payroll ${fmtPct(payPct)} of sales`, `${money(payroll)} on ${money(perSales.net)} of sales for the pay period ${dRange(per.start, per.end)}; target is ${settings.payrollTarget}% or less.`);
   if (tyR.disc !== null) {
     const up = lyOK && lyR.disc !== null ? tyR.disc - lyR.disc : null;
     if (tyR.disc >= settings.discWarn || (up !== null && up >= settings.discUpPts))
@@ -3194,7 +3308,10 @@ function OwnerDashboard({ dash, setDash, dailySales, liveInventory, dashGroups, 
         <Kpi title="Customers" value={fmtNum(ty.t.orders)} lines={[`${fmtV(tyR.atv, money)} average sale`, `${fmtV(tyR.upt, (x) => x.toFixed(2))} items per sale`, lyOK && lyT.orders !== null ? `${fmtNum(lyT.orders)} last year` : null]} />
         <Kpi title="Inventory" value={invTot ? money(invTot.value) : "—"} lines={[invTot ? `${fmtNum(invTot.units)} units${hasRetail ? `, ${money(invTot.retail)} retail` : ""}` : null, stockFits && ty.t.cogs !== null && invTot ? `${fmtPct((ty.t.cogs / (ty.t.cogs + invTot.value)) * 100)} sold through this week` : null]} />
         <Kpi title="Buying" tone={otb.canBuy > 0 ? INK : MUTED} value={money(otb.canBuy)} lines={[`left to buy for ${monthLabel(months[0])}`, `${money(otb.committed)} on order`, otb.over < 0 ? `${money(otb.over)} overbought elsewhere` : null]} />
-        <Kpi title="Payroll" tone={payTone} value={payroll !== undefined ? money(payroll) : "—"} lines={[payPct !== null ? `${fmtPct(payPct)} of sales${isWTD ? " so far" : ""}` : "enter it below", `target ${settings.payrollTarget}% or less`]} />
+        <Kpi title="Payroll" tone={payTone} value={payroll !== undefined ? money(payroll) : "—"} lines={[
+          !per ? "no pay period entered" : payPct !== null ? `${fmtPct(payPct)} of sales${perDone ? "" : " so far"}` : "sales for the period not all on file",
+          per ? `${perWeeks === 2 ? "2-week" : "1-week"} pay period ${dRange(per.start, per.end)}` : null,
+          `target ${settings.payrollTarget}% or less`]} />
       </div>
 
       {/* needs attention */}
@@ -3338,15 +3455,47 @@ function OwnerDashboard({ dash, setDash, dailySales, liveInventory, dashGroups, 
         </Section>
       </div>
 
-      <Section title="Payroll" note="Payroll for the same Monday–Sunday week. Saved per week.">
-        <div style={card} className="rounded-md p-4 flex flex-wrap items-end gap-6">
-          <label className="text-sm">
-            <div style={label} className="text-[11px] uppercase tracking-wider mb-1">Payroll cost, {dRange(weekStart, dAdd(weekStart, 6))}</div>
-            <input type="number" step="0.01" value={payroll ?? ""} onChange={(e) => setPayroll(e.target.value)} placeholder="0.00" className="border rounded px-2 py-1 w-40 text-right" style={{ borderColor: "#DCD5C4", fontFamily: "'IBM Plex Mono', monospace" }} />
-          </label>
-          <div><div style={label} className="text-[11px] uppercase tracking-wider">Of net sales</div><div style={{ ...big, color: payTone }} className="text-2xl font-bold">{fmtPct(payPct)}</div></div>
-          <div className="text-xs" style={{ color: MUTED }}>Green at or under {settings.payrollTarget}%, yellow to {settings.payrollWarn}%, red above. {isWTD ? "The week isn't finished, so this is against sales so far." : ""}</div>
-        </div>
+      <Section title="Payroll" note="Payroll cost is gross pay plus employer taxes, judged over the whole pay period against the sales of the same days." right={
+        <button onClick={() => openImport("payroll")} className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5" style={{ background: "#20232B", color: "#F1EEE6" }}><Icon.upload /> Import payroll</button>}>
+        {per ? (
+          <div style={card} className="rounded-md p-4 flex flex-wrap items-end gap-6">
+            <label className="text-sm">
+              <div style={label} className="text-[11px] uppercase tracking-wider mb-1">Pay period {dRange(per.start, per.end)}</div>
+              <input type="number" step="0.01" value={per.cost} onChange={(e) => editPeriodCost(per, e.target.value)} className="border rounded px-2 py-1 w-40 text-right" style={{ borderColor: "#DCD5C4", fontFamily: "'IBM Plex Mono', monospace" }} />
+            </label>
+            <div><div style={label} className="text-[11px] uppercase tracking-wider">Sales, same days</div><div style={{ ...big, color: INK }} className="text-2xl font-bold">{perSales && perSales.complete ? money(perSales.net) : "—"}</div></div>
+            <div><div style={label} className="text-[11px] uppercase tracking-wider">Payroll %</div><div style={{ ...big, color: payTone }} className="text-2xl font-bold">{fmtPct(payPct)}</div></div>
+            <div className="text-xs" style={{ color: MUTED, maxWidth: 380 }}>
+              {per.gross != null && Math.abs(per.gross + per.employerTax - per.cost) < 0.01
+                ? `Imported: gross pay ${fmtMoney2(per.gross)} + employer taxes ${fmtMoney2(per.employerTax)}, ${per.people} people. `
+                : "Entered by hand. "}
+              {perDone ? "" : `Period still running — ${perDays} of ${dDiff(per.start, per.end) + 1} days, so this is against sales so far. `}
+              {perSales && !perSales.complete ? `Only ${perSales.found} of ${perSales.n} days of sales on file. ` : ""}
+              Green at or under {settings.payrollTarget}%, yellow to {settings.payrollWarn}%, red above.{" "}
+              <button className="underline" onClick={() => deletePeriod(per)}>Remove this period</button>
+            </div>
+          </div>
+        ) : (
+          <div style={card} className="rounded-md p-4 flex flex-wrap items-end gap-4 text-sm">
+            <div className="text-xs w-full" style={{ color: MUTED }}>No pay period covers this week yet. Import the payroll file, or type the total here.</div>
+            <label><div style={label} className="text-[11px] uppercase tracking-wider mb-1">Period ends (Sunday)</div>
+              <input type="date" value={payDraft.end || suggestEnd} onChange={(e) => setPayDraft((d) => ({ ...d, end: e.target.value }))} className="border rounded px-2 py-1" style={{ borderColor: "#DCD5C4" }} /></label>
+            <label><div style={label} className="text-[11px] uppercase tracking-wider mb-1">Covers</div>
+              <select value={payDraft.weeks || perLen} onChange={(e) => setPayDraft((d) => ({ ...d, weeks: Number(e.target.value) }))} className="border rounded px-2 py-1" style={{ borderColor: "#DCD5C4" }}><option value={2}>2 weeks</option><option value={1}>1 week</option></select></label>
+            <label><div style={label} className="text-[11px] uppercase tracking-wider mb-1">Payroll cost</div>
+              <input type="number" step="0.01" value={payDraft.cost} onChange={(e) => setPayDraft((d) => ({ ...d, cost: e.target.value }))} placeholder="0.00" className="border rounded px-2 py-1 w-32 text-right" style={{ borderColor: "#DCD5C4", fontFamily: "'IBM Plex Mono', monospace" }} /></label>
+            {(() => {
+              const end = payDraft.end || suggestEnd, weeks = payDraft.weeks || perLen;
+              const ok = payDraft.cost !== "" && dParse(end).getDay() === 0 && dAdd(end, -(7 * weeks - 1)) <= weekStart && weekSun <= end;
+              return (
+                <>
+                  <button disabled={!ok} onClick={() => { savePeriod(end, weeks, payDraft.cost); setPayDraft({ end: "", weeks: 2, cost: "" }); }} className="text-xs px-3 py-2 rounded disabled:opacity-40" style={{ background: "#C99A3C", color: INK, fontWeight: 600 }}>Save pay period</button>
+                  {payDraft.cost !== "" && !ok && <span className="text-xs" style={{ color: BAD }}>The period has to end on a Sunday and include this week.</span>}
+                </>
+              );
+            })()}
+          </div>
+        )}
       </Section>
 
       <Section title="Categories" note="Planning categories, this week against the same week last year. Tap a category for its product types. Sell-through and weeks of supply are at cost, against the current stock snapshot.">
