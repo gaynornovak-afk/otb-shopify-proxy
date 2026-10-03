@@ -1,10 +1,3 @@
-
-
-
-
-
-
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -35,7 +28,7 @@ const CATW = 128, TYPEW = 220;
 const STORAGE_KEY = "otb-engine-v4";
 // Bump on every deploy. Shown in the header so "is this the build I just pushed?"
 // is answerable at a glance instead of by hunting for a changed control.
-const APP_VERSION = "v15";
+const APP_VERSION = "v16";
 
 // The five CSV formats the Import dialog accepts. Each import is now CHOSEN by name before a
 // file is loaded, not guessed afterwards: the chooser sets importLock, and parseAndPreview
@@ -64,9 +57,15 @@ const IMPORT_KINDS = {
   },
   dailySales: {
     label: "Daily Sales (last year)",
-    blurb: "Last year's store-wide sales by date. Not this year — that is the Sync button.",
-    needs: "A Day/Date column plus a Net Sales column, store-wide (not per product type) — e.g. Shopify's \"Sales over time\" report.",
-    note: "Powers Month Pace's weekday-matched Expected-to-date. Import last year's full month at minimum; re-importing is safe, existing dates are overwritten.",
+    blurb: "Store-wide sales by date, any year. Feeds Month Pace and the Owner Dashboard.",
+    needs: "A Day/Date column plus a Net Sales column, store-wide (not per product type) — e.g. Shopify's \"Sales over time\" report. Orders, Gross sales, Discounts, Returns, Net items sold and Cost of goods sold are also picked up when present.",
+    note: "Powers Month Pace's weekday-matched Expected-to-date and the Owner Dashboard's last-year and year-to-date figures. Any dates are fine, this year or last; re-importing is safe, existing dates are overwritten.",
+  },
+  salesBy: {
+    label: "Sales by Product Type / Vendor (daily)",
+    blurb: "Daily net sales split by product type and/or vendor. Feeds the Owner Dashboard's category and vendor comparisons.",
+    needs: "A Day/Date column, a Product type and/or Product vendor column, and Net sales. Net items sold and Cost of goods sold (or Gross profit) are used when present — e.g. a Shopify report grouped by Day and Product type.",
+    note: "Rolled up into Monday–Sunday weeks on import. Any week the file touches is replaced for that split, so export whole weeks.",
   },
   generic: {
     label: "Actuals / Plan",
@@ -89,6 +88,8 @@ function findStockCols(cols) {
     qtyCol: find(/^variant inventory qty$/i, /variant available inventory number/i, /^variant available$/i, /^inventory qty$/i, /^on hand$/i),
     costCol: find(/^cost per item$/i, /^variant cost$/i, /^unit cost$/i),
     handleCol: find(/^handle$/i, /^product handle$/i),
+    priceCol: find(/^variant price$/i, /^price$/i, /^retail price$/i),
+    vendorCol: find(/^vendor$/i, /^product vendor$/i),
   };
 }
 
@@ -96,7 +97,10 @@ function findStockCols(cols) {
 function detectFormat(cols) {
   if (cols.some((c) => c.toLowerCase().includes("shopify product type")) && cols.some((c) => c.toLowerCase().includes("beginning inv"))) return "bom";
   if (cols.includes("Product Type") && cols.includes("Total Cost Ordered") && cols.includes("Total Cost Received")) return "po";
-  if (!cols.includes("Product Type") && cols.some((c) => /^(day|date)$/i.test(c.trim())) && cols.some((c) => /sales/i.test(c))) return "dailySales";
+  const hasDay = cols.some((c) => /^(day|date)$/i.test(String(c).trim()));
+  const hasSales = cols.some((c) => /sales/i.test(c));
+  if (hasDay && hasSales && cols.some((c) => /^(product type|product vendor|vendor)$/i.test(String(c).trim()))) return "salesBy";
+  if (!cols.includes("Product Type") && hasDay && hasSales) return "dailySales";
   const sc = findStockCols(cols);
   if (sc.typeCol && sc.qtyCol && sc.costCol) return "stock";
   if (cols.includes("Product Type") && cols.includes("Month")) return "generic";
@@ -321,6 +325,12 @@ function OTBEngine() {
   const [showSync, setShowSync] = useState(false);
   const [showVendors, setShowVendors] = useState(false);
   const [showMonthPace, setShowMonthPace] = useState(false);
+  const [showDashboard, setShowDashboard] = useState(false);
+  // Owner Dashboard data, kept in one key so nothing the buy engine reads is touched:
+  // dailyDetail {date: {net, gross, discounts, returns, orders, units, cogs}}, weeklyByType /
+  // weeklyByVendor {monday: {days, rows, src}}, invHistory [...], poByVendor, payroll {monday: $},
+  // settings (alert thresholds), lyOverrides {monday: LY monday}.
+  const [dash, setDash] = useState({});
   // --- Buy Board -------------------------------------------------------------
   const [showBuyBoard, setShowBuyBoard] = useState(false);
   const [buyView, setBuyView] = useState("month");     // "month" = one month in detail, "season" = all 12
@@ -376,6 +386,7 @@ function OTBEngine() {
           if (parsed.coverOverride !== undefined) setCoverOverride(parsed.coverOverride);
           if (parsed.useTrend !== undefined) setUseTrend(parsed.useTrend);
           setSkippedMonths(parsed.skippedMonths || []);
+          setDash(parsed.dash || {});
           loadedFromServer = true;
         }
       } catch (e) { /* server unreachable or not configured yet - fall through to local copy below */ }
@@ -395,6 +406,7 @@ function OTBEngine() {
             if (parsed.coverOverride !== undefined) setCoverOverride(parsed.coverOverride);
             if (parsed.useTrend !== undefined) setUseTrend(parsed.useTrend);
             setSkippedMonths(parsed.skippedMonths || []);
+            setDash(parsed.dash || {});
           }
         } catch (e2) { /* first run, nothing anywhere yet */ }
       }
@@ -406,7 +418,7 @@ function OTBEngine() {
     if (!loaded) return;
     setSaveState("saving");
     const t = setTimeout(async () => {
-      const payload = { assumptions, startingBOM, data, dailySales, planGroups, liveInventory, coverOverride, useTrend, skippedMonths };
+      const payload = { assumptions, startingBOM, data, dailySales, planGroups, liveInventory, coverOverride, useTrend, skippedMonths, dash };
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payload)); // always keep a local backup copy too
       } catch (e) { /* ignore quota errors */ }
@@ -416,7 +428,7 @@ function OTBEngine() {
       } catch (e) { setSaveState("saved locally only"); }
     }, 400);
     return () => clearTimeout(t);
-  }, [assumptions, startingBOM, data, dailySales, planGroups, liveInventory, coverOverride, useTrend, skippedMonths, loaded]);
+  }, [assumptions, startingBOM, data, dailySales, planGroups, liveInventory, coverOverride, useTrend, skippedMonths, dash, loaded]);
 
   function getAssumptions(cat) { return assumptions[cat] || defaultAssumptions(); }
   function setAssumption(cat, patch) { setAssumptions((prev) => ({ ...prev, [cat]: { ...getAssumptions(cat), ...patch } })); }
@@ -803,8 +815,27 @@ function OTBEngine() {
                allSkipped: full.map((x) => x.skipped) };
     }).filter((r) => r.types.length);
 
+    // Owner Dashboard: THIS month by planning group, whatever the board's own month cursor or
+    // row setting is - same engine, same cover, same trend switch, so the dashboard's "can still
+    // buy" is always the Buy Board's current-month answer to the dollar.
+    const dashGroups = groupNames.map((g) => {
+      const types = typesByGroup[g] || [];
+      if (!types.length) return null;
+      const full = seriesForGroup(types, coverFor(types).weeks, useTrend);
+      const s0 = full[0];
+      const received = types.reduce((a, t) => a + num(getRow(t, months[0]).received), 0);
+      const open = types.reduce((a, t) => a + num(getRow(t, months[0]).balanceToReceive) + overdueBalance(t), 0);
+      return {
+        g, types, net: s0.net, buy: s0.buy, onOrder: s0.onOrder, received, open,
+        planned: s0.net + s0.onOrder,  // what the month needs landing to reach its cover target
+        next3OnOrder: full.slice(0, 3).reduce((a, x) => a + x.onOrder, 0),
+        next3Cogs: full.slice(0, 3).reduce((a, x) => a + x.cogs, 0),
+        ahead: full.slice(1).map((x) => ({ m: x.m, amt: x.onOrder })),
+      };
+    }).filter(Boolean);
+
     return {
-      rows,
+      rows, dashGroups,
       total: rows.reduce((a, r) => a + r.buy, 0),
       over: rows.reduce((a, r) => a + Math.min(0, r.net), 0),
       rawTotal: rows.reduce((a, r) => a + r.rawBuy, 0),
@@ -997,7 +1028,7 @@ function OTBEngine() {
         if (!lock) { // no format chosen yet - shouldn't happen via the chooser, but stay safe
           if (!detected) { setImportError("Could not tell what kind of file this is from its column headers."); setImportPreview(null); return; }
           setImportFormat(detected);
-          setImportPreview(res.data.slice(0, detected === "stock" ? 60000 : 5000));
+          setImportPreview(res.data.slice(0, ["stock", "salesBy", "dailySales"].includes(detected) ? 100000 : 5000));
           return;
         }
         if (detected !== lock) {
@@ -1012,7 +1043,7 @@ function OTBEngine() {
           return;
         }
         setImportFormat(lock);
-        setImportPreview(res.data.slice(0, lock === "stock" ? 60000 : 5000));
+        setImportPreview(res.data.slice(0, ["stock", "salesBy", "dailySales"].includes(lock) ? 100000 : 5000));
       },
       error: (err) => { setImportError("Could not parse that CSV: " + err.message); setImportPreview(null); },
     });
@@ -1050,6 +1081,7 @@ function OTBEngine() {
     if (importFormat === "bom") { applyBOMImport(); return; }
     if (importFormat === "dailySales") { applyDailySalesImport(); return; }
     if (importFormat === "stock") { applyStockImport(); return; }
+    if (importFormat === "salesBy") { applySalesByImport(); return; }
     const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
     setData((prev) => {
       const next = { ...prev };
@@ -1084,7 +1116,15 @@ function OTBEngine() {
     const monthOf = (dateStr) => { const s = (dateStr || "").trim(); return /^\d{4}-\d{2}/.test(s) ? s.slice(0, 7) : null; };
     const totals = {}; // type -> month -> { received, balance }
     let matchedRows = 0, skippedRows = 0;
+    const poCols = Object.keys(importPreview[0] || {});
+    const poVendorCol = poCols.find((c) => /^(vendor|supplier|vendor name|supplier name)$/i.test(c.trim()));
+    const openByVendor = {};
     importPreview.forEach((r) => {
+      if (poVendorCol) {
+        const v = String(r[poVendorCol] || "").trim() || "(No vendor set)";
+        const bal = Math.max(0, (Number(r["Total Cost Ordered"]) || 0) - (Number(r["Total Cost Received"]) || 0));
+        if (bal > 0.005) openByVendor[v] = (openByVendor[v] || 0) + bal;
+      }
       const typeName = (r["Product Type"] || "").trim();
       if (!typeName || !validTypes.has(typeName.toLowerCase())) { skippedRows++; return; }
       const match = TAXONOMY.find((t) => t[0].toLowerCase() === typeName.toLowerCase())[0];
@@ -1145,7 +1185,9 @@ function OTBEngine() {
       });
       return next;
     });
+    if (poVendorCol) setDash((prev) => ({ ...prev, poByVendor: poReplaceAll ? openByVendor : { ...(prev.poByVendor || {}), ...openByVendor } }));
     setImportSummary(`Applied ${matchedRows} line items across ${Object.keys(totals).length} product types`
+      + (poVendorCol ? ` (on-order also kept by vendor)` : ` (no Vendor column, so the dashboard can't show on-order by vendor)`)
       + (poReplaceAll ? ", replacing all on-order across every product type." : " (on-order replaced for those types only).")
       + (stale.length
           ? (poReplaceAll
@@ -1205,20 +1247,98 @@ function OTBEngine() {
   function applyDailySalesImport() {
     const cols = Object.keys(importPreview[0] || {});
     const dateCol = cols.find((c) => /^(day|date)$/i.test(c.trim()));
-    const salesCol = cols.find((c) => /sales/i.test(c));
+    // NET sales first: a full Shopify export also carries Gross sales and Total sales, and taking
+    // whichever "sales" column came first would have read gross as net.
+    const salesCol = cols.find((c) => /^net sales$/i.test(c.trim())) || cols.find((c) => /sales/i.test(c) && !/gross|total/i.test(c)) || cols.find((c) => /sales/i.test(c));
     if (!dateCol || !salesCol) { setImportError("Could not find a Day/Date column and a Sales column in this file."); return; }
+    // Optional columns for the Owner Dashboard. Shopify writes discounts and returns as negatives.
+    const opt = {
+      orders: cols.find((c) => /^orders$/i.test(c.trim())),
+      gross: cols.find((c) => /^gross sales$/i.test(c.trim())),
+      discounts: cols.find((c) => /^discounts$/i.test(c.trim())),
+      returns: cols.find((c) => /^returns$/i.test(c.trim())),
+      units: cols.find((c) => /^(net items sold|net quantity|units sold|net units sold)$/i.test(c.trim())),
+      cogs: cols.find((c) => /^(cost of goods sold|cogs)$/i.test(c.trim())),
+      gp: cols.find((c) => /^gross profit$/i.test(c.trim())),
+    };
+    const toNum = (v) => { const t = String(v ?? "").replace(/[^0-9.\-]/g, ""); return t === "" ? null : Number(t); };
     let matched = 0, skipped = 0;
-    const updates = {};
+    const updates = {}, detail = {};
     importPreview.forEach((r) => {
       const iso = parseDailyDateToISO(r[dateCol]);
-      const amt = Number(String(r[salesCol] ?? "").replace(/[^0-9.\-]/g, ""));
-      if (!iso || isNaN(amt)) { skipped++; return; }
+      const amt = toNum(r[salesCol]);
+      if (!iso || amt === null || isNaN(amt)) { skipped++; return; }
       updates[iso] = amt;
+      const d = { net: amt, src: "import" };
+      if (opt.orders) d.orders = toNum(r[opt.orders]) || 0;
+      if (opt.gross) d.gross = Math.abs(toNum(r[opt.gross]) || 0);
+      if (opt.discounts) d.discounts = Math.abs(toNum(r[opt.discounts]) || 0);
+      if (opt.returns) d.returns = Math.abs(toNum(r[opt.returns]) || 0);
+      if (opt.units) d.units = toNum(r[opt.units]) || 0;
+      if (opt.cogs) d.cogs = Math.abs(toNum(r[opt.cogs]) || 0);
+      else if (opt.gp) d.cogs = amt - (toNum(r[opt.gp]) || 0);
+      detail[iso] = d;
       matched++;
     });
     setDailySales((prev) => ({ ...prev, ...updates }));
-    setImportSummary(`Imported daily sales for ${matched} day(s)${skipped ? `, skipped ${skipped} row(s) that didn't parse` : ""}.`);
+    setDash((prev) => ({ ...prev, dailyDetail: { ...(prev.dailyDetail || {}), ...detail } }));
+    const found = Object.entries(opt).filter(([, c]) => c).map(([k]) => k);
+    const missing = ["orders", "gross", "discounts", "returns", "units", "cogs"].filter((k) => !opt[k] && !(k === "cogs" && opt.gp));
+    const dates = Object.keys(updates).sort();
+    setImportSummaryTone(missing.length ? "warn" : "ok");
+    setImportSummary(`Imported daily sales for ${matched} day(s)${dates.length ? `, ${dates[0]} to ${dates[dates.length - 1]}` : ""}${skipped ? `, skipped ${skipped} row(s) that didn't parse` : ""}.`
+      + (missing.length ? ` Not in this file, so the dashboard can't compare them: ${missing.join(", ")}.` : " All dashboard columns found."));
     setImportText(""); setImportPreview(null); // dialog stays open so the result is actually read
+  }
+  // Daily sales split by product type and/or vendor, rolled into Monday-Sunday weeks. Weekly is
+  // all the dashboard needs and keeps the saved state small (a year of daily-by-type is ~15,000
+  // rows). Every week the file touches is REPLACED for that split, so a re-import never doubles.
+  function applySalesByImport() {
+    const cols = Object.keys(importPreview[0] || {});
+    const f = (re) => cols.find((c) => re.test(String(c).trim()));
+    const dateCol = f(/^(day|date)$/i), typeCol = f(/^product type$/i), vendorCol = f(/^(product vendor|vendor)$/i);
+    const netCol = f(/^net sales$/i) || cols.find((c) => /sales/i.test(c) && !/gross|total/i.test(c));
+    const unitsCol = f(/^(net items sold|net quantity|units sold|net units sold)$/i);
+    const cogsCol = f(/^(cost of goods sold|cogs)$/i), gpCol = f(/^gross profit$/i);
+    if (!dateCol || !netCol || (!typeCol && !vendorCol)) { setImportError("Needs a Day/Date column, a Product type or Product vendor column, and Net sales."); return; }
+    const canon = Object.fromEntries(TAXONOMY.map(([t]) => [t.toLowerCase(), t]));
+    const toNum = (v) => Number(String(v ?? "").replace(/[^0-9.\-]/g, "")) || 0;
+    const mondayOf = (iso) => { const [y, m, d] = iso.split("-").map(Number); const dt = new Date(y, m - 1, d); dt.setDate(dt.getDate() - ((dt.getDay() + 6) % 7)); return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`; };
+    const byType = {}, byVendor = {}, datesByWeek = {};
+    let rows = 0, skipped = 0;
+    const add = (map, wk, key, net, units, cogs) => {
+      map[wk] = map[wk] || {};
+      const r = map[wk][key] || (map[wk][key] = { net: 0, units: 0, cogs: 0 });
+      r.net += net; r.units += units; r.cogs += cogs;
+    };
+    importPreview.forEach((r) => {
+      const iso = parseDailyDateToISO(r[dateCol]);
+      if (!iso) { skipped++; return; }
+      const wk = mondayOf(iso);
+      (datesByWeek[wk] = datesByWeek[wk] || new Set()).add(iso);
+      const net = toNum(r[netCol]);
+      const units = unitsCol ? toNum(r[unitsCol]) : 0;
+      const cogs = cogsCol ? Math.abs(toNum(r[cogsCol])) : gpCol ? net - toNum(r[gpCol]) : 0;
+      if (typeCol) { const raw = String(r[typeCol] || "").trim(); add(byType, wk, canon[raw.toLowerCase()] || raw || "9999 Unclassified", net, units, cogs); }
+      if (vendorCol) { const v = String(r[vendorCol] || "").trim() || "(No vendor set)"; add(byVendor, wk, v, net, units, cogs); }
+      rows++;
+    });
+    const round = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, { net: Math.round(v.net * 100) / 100, units: Math.round(v.units * 100) / 100, cogs: Math.round(v.cogs * 100) / 100 }]));
+    const weeks = Object.keys(datesByWeek).sort();
+    setDash((prev) => {
+      const next = { ...prev };
+      if (typeCol) { const w = { ...(prev.weeklyByType || {}) }; weeks.forEach((wk) => { w[wk] = { days: datesByWeek[wk].size, rows: round(byType[wk] || {}), src: "import", cogs: !!(cogsCol || gpCol), units: !!unitsCol }; }); next.weeklyByType = w; }
+      if (vendorCol) { const w = { ...(prev.weeklyByVendor || {}) }; weeks.forEach((wk) => { w[wk] = { days: datesByWeek[wk].size, rows: round(byVendor[wk] || {}), src: "import", cogs: !!(cogsCol || gpCol), units: !!unitsCol }; }); next.weeklyByVendor = w; }
+      return next;
+    });
+    const partial = weeks.filter((wk) => datesByWeek[wk].size < 7);
+    setImportSummaryTone(partial.length || !(cogsCol || gpCol) || !unitsCol ? "warn" : "ok");
+    setImportSummary(`Imported ${rows.toLocaleString()} rows into ${weeks.length} week(s)${weeks.length ? `, ${weeks[0]} to ${weeks[weeks.length - 1]}` : ""}, split by ${[typeCol && "product type", vendorCol && "vendor"].filter(Boolean).join(" and ")}.`
+      + (skipped ? ` Skipped ${skipped} row(s) with no readable date.` : "")
+      + (partial.length ? ` ${partial.length} week(s) at the edges of the file are incomplete (${partial.slice(0, 3).join(", ")}${partial.length > 3 ? ", …" : ""}) and won't be used for comparisons — re-export from a Monday to a Sunday to fill them.` : "")
+      + (!unitsCol ? " No units column." : "")
+      + (!(cogsCol || gpCol) ? " No cost column, so margin by category/vendor last year isn't available." : ""));
+    setImportText(""); setImportPreview(null);
   }
   // Aggregates Shopify's native product export (one row per variant) into inventory value per
   // Product Type, feeding straight into the same liveInventory shape the live "Check current
@@ -1228,12 +1348,14 @@ function OTBEngine() {
   function applyStockImport() {
     const validTypes = new Set(TAXONOMY.map((t) => t[0].toLowerCase()));
     const cols = Object.keys(importPreview[0] || {});
-    const { typeCol, qtyCol, costCol, handleCol } = findStockCols(cols);
+    const { typeCol, qtyCol, costCol, handleCol, priceCol, vendorCol } = findStockCols(cols);
     if (!typeCol || !qtyCol || !costCol) {
       setImportError(`Could not find the product type, quantity and unit cost columns in this file. Found: ${cols.slice(0, 8).join(", ")}${cols.length > 8 ? ", …" : ""}.`);
       return;
     }
     const totals = {};
+    const byVendor = {};
+    let lastVendor = "";
     // Forward-fill a blank type from the product's FIRST row only - reset per Handle, so a
     // variant can never inherit the type of an unrelated product, and only remember types that
     // are actually in the taxonomy so junk can't propagate either.
@@ -1243,7 +1365,10 @@ function OTBEngine() {
     let negativeUnits = 0;
     importPreview.forEach((r) => {
       const handleVal = handleCol ? String(r[handleCol] ?? "").trim() : null;
-      if (handleCol && handleVal !== lastHandle) { lastHandle = handleVal; lastType = ""; }
+      if (handleCol && handleVal !== lastHandle) { lastHandle = handleVal; lastType = ""; lastVendor = ""; }
+      let vendorName = vendorCol ? String(r[vendorCol] ?? "").trim() : "";
+      if (!vendorName && lastVendor) vendorName = lastVendor;
+      if (vendorName) lastVendor = vendorName;
       let typeName = String(r[typeCol] ?? "").trim();
       if (!typeName && lastType) typeName = lastType;
       if (typeName && validTypes.has(typeName.toLowerCase())) lastType = typeName;
@@ -1262,16 +1387,43 @@ function OTBEngine() {
       // subtract stock the shop does not have from a type that does, so clamp at zero and say so.
       const useQty = qty < 0 ? 0 : qty;
       if (qty < 0) negativeUnits += 1;
-      if (!totals[match]) totals[match] = { units: 0, value: 0 };
+      const price = priceCol ? (Number(String(r[priceCol] ?? "").replace(/[^0-9.\-]/g, "")) || 0) : 0;
+      if (!totals[match]) totals[match] = { units: 0, value: 0, retail: 0 };
       totals[match].units += useQty;
       totals[match].value += useQty * cost;
+      totals[match].retail += useQty * price;
+      if (vendorCol) {
+        const vk = vendorName || "(No vendor set)";
+        if (!byVendor[vk]) byVendor[vk] = { units: 0, value: 0, retail: 0 };
+        byVendor[vk].units += useQty; byVendor[vk].value += useQty * cost; byVendor[vk].retail += useQty * price;
+      }
       matched++;
     });
     const typeCount = Object.keys(totals).length;
-    setLiveInventory({ totals, loadedAt: new Date(), truncated: false, variantsScanned: variantCount, source: "import" });
+    setLiveInventory({ totals, byVendor: vendorCol ? byVendor : null, hasRetail: !!priceCol, loadedAt: new Date(), truncated: false, variantsScanned: variantCount, source: "import" });
     const totalUnits = Object.values(totals).reduce((s, t) => s + t.units, 0);
     const totalValue = Object.values(totals).reduce((s, t) => s + t.value, 0);
-    const bits = [`${matched} of ${variantCount} rows matched, across ${typeCount} product type${typeCount === 1 ? "" : "s"} — ${totalUnits.toLocaleString()} units, ${moneyExact(totalValue)} at cost.`];
+    const totalRetail = Object.values(totals).reduce((s, t) => s + t.retail, 0);
+    // Keep a small dated summary of every snapshot, so inventory can be compared with a year ago
+    // once a year of history exists. One entry per day; the latest import that day wins.
+    {
+      const dt = new Date();
+      const day = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+      const byCat = {};
+      Object.entries(totals).forEach(([t, v]) => { const c = CATEGORY_OF[t] || "Other"; byCat[c] = Math.round((byCat[c] || 0) + v.value); });
+      const vend = {};
+      Object.entries(byVendor).forEach(([v, x]) => { vend[v] = Math.round(x.value); });
+      const entry = { date: day, value: Math.round(totalValue), retail: priceCol ? Math.round(totalRetail) : null, units: totalUnits, byCat, byVendor: vendorCol ? vend : null };
+      setDash((prev) => {
+        const hist = (prev.invHistory || []).filter((h) => h.date !== day);
+        hist.push(entry);
+        hist.sort((a, b) => (a.date < b.date ? -1 : 1));
+        return { ...prev, invHistory: hist.slice(-110) };
+      });
+    }
+    const bits = [`${matched} of ${variantCount} rows matched, across ${typeCount} product type${typeCount === 1 ? "" : "s"} — ${totalUnits.toLocaleString()} units, ${moneyExact(totalValue)} at cost${priceCol ? `, ${moneyExact(totalRetail)} at retail` : ""}.`];
+    if (!priceCol) bits.push("No price column, so inventory at retail isn't available.");
+    if (!vendorCol) bits.push("No vendor column, so vendor inventory isn't available.");
     if (negativeUnits) bits.push(`${negativeUnits} negative on-hand row(s) counted as zero.`);
     if (unmatched.size) {
       const list = [...unmatched.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([k, n]) => `${k} (${n})`);
@@ -1579,17 +1731,20 @@ function OTBEngine() {
               <span style={{ color: "#8C6E4A", fontWeight: 600 }}>{APP_VERSION}</span> · category · product type · 12 months · {saveState === "saving" ? "saving…" : saveState === "saved" ? "saved (synced)" : saveState === "saved locally only" ? "saved on this device only - set up server storage to sync across devices" : ""}
             </div>
           </div>
-          <div className="flex gap-2">
+          <div className="flex gap-2 flex-wrap">
+            <button onClick={() => { setShowDashboard((v) => !v); setShowBuyBoard(false); setShowMonthPace(false); }} style={{ background: showDashboard ? "#C99A3C" : "#2A303B", color: showDashboard ? "#20232B" : "#EDE7DA", border: "1px solid #3A4150", fontWeight: 700 }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
+              <Icon.sliders /> Owner
+            </button>
             <button onClick={() => setShowSync(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
               <Icon.wifi /> Sync
             </button>
             <button onClick={() => setShowVendors(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
               <Icon.sliders /> Vendors
             </button>
-            <button onClick={() => { setShowBuyBoard((v) => !v); setShowMonthPace(false); }} style={{ background: showBuyBoard ? "#C99A3C" : "#2A303B", color: showBuyBoard ? "#20232B" : "#EDE7DA", border: "1px solid #3A4150", fontWeight: 700 }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
+            <button onClick={() => { setShowBuyBoard((v) => !v); setShowMonthPace(false); setShowDashboard(false); }} style={{ background: showBuyBoard ? "#C99A3C" : "#2A303B", color: showBuyBoard ? "#20232B" : "#EDE7DA", border: "1px solid #3A4150", fontWeight: 700 }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
               <Icon.download /> Buy Board
             </button>
-            <button onClick={() => { setShowMonthPace((v) => !v); setShowBuyBoard(false); }} style={{ background: showMonthPace ? "#C99A3C" : "#2A303B", color: showMonthPace ? "#20232B" : "#EDE7DA", border: "1px solid #3A4150", fontWeight: showMonthPace ? 700 : 400 }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
+            <button onClick={() => { setShowMonthPace((v) => !v); setShowBuyBoard(false); setShowDashboard(false); }} style={{ background: showMonthPace ? "#C99A3C" : "#2A303B", color: showMonthPace ? "#20232B" : "#EDE7DA", border: "1px solid #3A4150", fontWeight: showMonthPace ? 700 : 400 }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
               <Icon.refresh /> Month Pace
             </button>
             <button onClick={() => setShowSettings(true)} style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} className="text-xs sm:text-sm px-3 py-2 rounded flex items-center gap-1.5">
@@ -1609,7 +1764,9 @@ function OTBEngine() {
       </div>
 
       <div className="px-4 sm:px-8 py-4" style={{ background: "#20232B" }}>
-        {showMonthPace && monthPace ? (
+        {showDashboard ? (
+          <div style={{ fontFamily: "'Roboto Slab', serif", color: "#EDE7DA" }} className="text-xl font-bold">Owner dashboard</div>
+        ) : showMonthPace && monthPace ? (
           <div className="flex flex-wrap items-center gap-8">
             <div>
               <div style={{ color: "#9AA0AC", fontFamily: "'IBM Plex Mono', monospace" }} className="text-[11px] uppercase tracking-wider">{monthLabel(monthPace.mStr)} — days elapsed</div>
@@ -1660,7 +1817,11 @@ function OTBEngine() {
         )}
       </div>
 
-      {showBuyBoard && buyBoard ? (
+      {showDashboard ? (
+        <OwnerDashboard dash={dash} setDash={setDash} dailySales={dailySales} liveInventory={liveInventory}
+          dashGroups={buyBoard ? buyBoard.dashGroups : []} getRow={getRow} overdueBalance={overdueBalance}
+          months={months} getAssumptions={getAssumptions} openImport={openImport} />
+      ) : showBuyBoard && buyBoard ? (
       <div className="px-4 sm:px-8 py-5">
         <div style={{ background: "#20232B" }} className="rounded-md p-5 mb-4 flex flex-wrap items-center gap-10">
           <div>
@@ -2467,7 +2628,7 @@ function OTBEngine() {
             <>
               <p className="text-sm mb-3" style={{ color: "#5C6270" }}>Which file are you importing? Pick one — the app will check your file matches before it changes anything.</p>
               <div className="flex flex-col gap-2 mb-1">
-                {["stock", "bom", "po", "dailySales", "generic"].map((k) => (
+                {["stock", "bom", "po", "dailySales", "salesBy", "generic"].map((k) => (
                   <button key={k} onClick={() => openImport(k)} className="text-left px-3 py-2 rounded" style={{ background: "#F1EEE6", border: "1px solid #DCD5C4" }}>
                     <div className="text-sm flex items-center gap-1.5" style={{ color: "#20232B", fontWeight: 600 }}><Icon.upload /> {IMPORT_KINDS[k].label}</div>
                     <div className="text-xs mt-0.5" style={{ color: "#5C6270" }}>{IMPORT_KINDS[k].blurb}</div>
@@ -2521,7 +2682,9 @@ function OTBEngine() {
                     : importFormat === "bom"
                     ? `${r[Object.keys(r).find((c) => c.toLowerCase().includes("shopify product type"))]} · ${r[Object.keys(r).find((c) => c.toLowerCase().includes("beginning inv"))]}`
                     : importFormat === "dailySales"
-                    ? `${r[Object.keys(r).find((c) => /^(day|date)$/i.test(c.trim()))]} · ${r[Object.keys(r).find((c) => /sales/i.test(c))]}`
+                    ? `${r[Object.keys(r).find((c) => /^(day|date)$/i.test(c.trim()))]} · ${r[Object.keys(r).find((c) => /^net sales$/i.test(c.trim())) || Object.keys(r).find((c) => /sales/i.test(c))]}`
+                    : importFormat === "salesBy"
+                    ? Object.keys(r).filter((c) => /^(day|date|product type|product vendor|vendor|net sales)$/i.test(c.trim())).map((c) => r[c]).join(" · ")
                     : importFormat === "stock"
                     ? (() => { const sc = findStockCols(Object.keys(r)); return `${r[sc.typeCol] || "(blank - forward-filled)"} · qty ${r[sc.qtyCol]} · cost ${r[sc.costCol]}`; })()
                     : `${r["Product Type"]} · ${r["Month"]} · LY Sales ${r["LY Sales"] ?? "—"} · LY COGS ${r["LY COGS"] ?? "—"}`}
@@ -2592,6 +2755,665 @@ function TypeDetail({ type, months, series, scrollStart, setScrollStart, visible
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+// ===== Owner Dashboard =======================================================
+// One screen, read in a minute: how the week went against the same week last year, how the year
+// is going, what the stock looks like, how much is left to buy, and a short list of things worth
+// a look. It computes nothing the buy engine depends on and writes only to the `dash` key.
+//
+// Weeks run Monday-Sunday (payroll's week), so every sale lands in exactly one week and weeks add
+// up to months and years. Last year's week is the one exactly 364 days earlier - same weekdays -
+// unless a holiday override says otherwise. An unfinished week is compared day-for-day.
+const DASH_DEFAULTS = {
+  payrollTarget: 20, payrollWarn: 23,
+  salesWarn: 10, salesBad: 20, ytdWarn: 5,
+  gmWarn: 3, gmBad: 6,
+  discWarn: 20, discBad: 30, discUpPts: 5,
+  wosWarn: 20, wosBad: 30, minInv: 2000,
+  catSalesWarn: 25, minSales: 500,
+  otbNearPct: 10, otbOverMin: 1000, commitRatio: 1.5,
+  vendInvGrowth: 15, vendSalesDrop: 15,
+};
+const DASH_SETTING_LABELS = [
+  ["payrollTarget", "Payroll target, % of sales (green at or under)", "%"],
+  ["payrollWarn", "Payroll red above", "%"],
+  ["salesWarn", "Week sales below LY — watch at", "%"],
+  ["salesBad", "Week sales below LY — investigate at", "%"],
+  ["ytdWarn", "Year-to-date below LY — watch at", "%"],
+  ["gmWarn", "Margin down vs LY — watch at", "pts"],
+  ["gmBad", "Margin down vs LY — investigate at", "pts"],
+  ["discWarn", "Discounts, % of gross — watch at", "%"],
+  ["discBad", "Discounts, % of gross — investigate at", "%"],
+  ["discUpPts", "Discounts up vs LY — watch at", "pts"],
+  ["wosWarn", "Category weeks of supply — watch at", "wks"],
+  ["wosBad", "Category weeks of supply — investigate at", "wks"],
+  ["minInv", "Ignore stock positions under", "$"],
+  ["catSalesWarn", "Category sales below LY — watch at", "%"],
+  ["minSales", "Ignore category/vendor sales under", "$"],
+  ["otbNearPct", "Buying nearly used up when under", "% left"],
+  ["otbOverMin", "Ignore overbought groups under", "$"],
+  ["commitRatio", "On order vs 3 months' selling — watch at", "×"],
+  ["vendInvGrowth", "Vendor stock growth — watch at", "%"],
+  ["vendSalesDrop", "…while vendor sales down by", "%"],
+];
+const DAY_FIELDS = ["gross", "discounts", "returns", "net", "orders", "units", "cogs"];
+const GOOD = "#3F7A3F", WARN = "#A87A1E", BAD = "#B5432D", INK = "#20232B", MUTED = "#6C727E";
+
+function dYMD(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; }
+function dParse(s) { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); }
+function dAdd(s, n) { const d = dParse(s); d.setDate(d.getDate() + n); return dYMD(d); }
+function dMonday(s) { const d = dParse(s); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return dYMD(d); }
+function dDiff(a, b) { return Math.round((dParse(b) - dParse(a)) / 86400000); }
+function dLabel(s, withYear) { return dParse(s).toLocaleDateString("en-US", { month: "short", day: "numeric", ...(withYear ? { year: "numeric" } : {}) }); }
+function dRange(a, b) { return `${dLabel(a)} – ${dLabel(b, true)}`; }
+
+// Sum a run of days. A field is only totalled if every day found carries it - a half-populated
+// figure would compare badly against a complete one and look like a real change.
+function sumDays(getDay, start, n) {
+  const out = {}, has = {};
+  DAY_FIELDS.forEach((f) => { out[f] = 0; has[f] = true; });
+  let found = 0;
+  for (let i = 0; i < n; i++) {
+    const day = getDay(dAdd(start, i));
+    if (!day) continue;
+    found++;
+    DAY_FIELDS.forEach((f) => { if (typeof day[f] === "number") out[f] += day[f]; else has[f] = false; });
+  }
+  DAY_FIELDS.forEach((f) => { if (!has[f] || !found) out[f] = null; });
+  return { ...out, found, n, complete: found === n };
+}
+function ratios(t) {
+  if (!t) return {};
+  const ok = (v) => v !== null && v !== undefined;
+  return {
+    gp: ok(t.net) && ok(t.cogs) ? t.net - t.cogs : null,
+    gm: ok(t.net) && ok(t.cogs) && t.net > 0 ? ((t.net - t.cogs) / t.net) * 100 : null,
+    atv: ok(t.net) && t.orders ? t.net / t.orders : null,
+    upt: ok(t.units) && t.orders ? t.units / t.orders : null,
+    disc: ok(t.discounts) && t.gross ? (t.discounts / t.gross) * 100 : null,
+  };
+}
+const chg = (a, b) => (a === null || a === undefined || !b ? null : ((a - b) / Math.abs(b)) * 100);
+const fmtChg = (x) => (x === null || x === undefined ? "—" : `${x >= 0 ? "+" : ""}${x.toFixed(1)}%`);
+const fmtPct = (x, dp = 1) => (x === null || x === undefined ? "—" : `${x.toFixed(dp)}%`);
+const fmtPts = (x) => (x === null || x === undefined ? "—" : `${x >= 0 ? "+" : ""}${x.toFixed(1)} pts`);
+const fmtNum = (x, dp = 0) => (x === null || x === undefined ? "—" : x.toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp }));
+const fmtMoney2 = (x) => (x === null || x === undefined ? "—" : x.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+const vkey = (v) => String(v || "").trim().toLowerCase();
+const canonType = (() => { const m = Object.fromEntries(TAXONOMY.map(([t]) => [t.toLowerCase(), t])); return (t) => m[String(t || "").trim().toLowerCase()] || t; })();
+function normTypeRows(rows) {
+  if (!rows) return null;
+  const out = {};
+  Object.entries(rows).forEach(([t, r]) => { const k = canonType(t); const o = out[k] || (out[k] = { net: 0, units: 0, cogs: 0 }); o.net += r.net || 0; o.units += r.units || 0; o.cogs += r.cogs || 0; });
+  return out;
+}
+function scaleRows(rows, k) {
+  if (!rows || k === null || k === undefined) return null;
+  return Object.fromEntries(Object.entries(rows).map(([key, r]) => [key, { net: r.net * k, units: r.units * k, cogs: r.cogs * k }]));
+}
+
+// Defined outside the component so React keeps their inputs mounted between keystrokes.
+const card = { background: "#FFFFFF", border: "1px solid #DCD5C4" };
+const label = { color: "#8B8F98", fontFamily: "'IBM Plex Mono', monospace" };
+const big = { fontFamily: "'Roboto Slab', serif" };
+const th = { position: "sticky", top: 0, background: "#20232B", color: "#EDE7DA", zIndex: 2 };
+const Section = ({ title, note, children, right }) => (
+  <div className="mb-6">
+    <div className="flex items-baseline justify-between flex-wrap gap-2 mb-2">
+      <div style={{ ...big, color: INK }} className="text-lg font-bold">{title}</div>
+      {right}
+    </div>
+    {note && <p className="text-xs mb-2" style={{ color: MUTED, maxWidth: 820 }}>{note}</p>}
+    {children}
+  </div>
+);
+const Kpi = ({ title, value, tone, lines }) => (
+  <div style={card} className="rounded-md p-4">
+    <div style={label} className="text-[11px] uppercase tracking-wider">{title}</div>
+    <div style={{ ...big, color: tone || INK }} className="text-2xl sm:text-3xl font-bold mt-1">{value}</div>
+    {lines.filter(Boolean).map((l, i) => <div key={i} className="text-xs mt-1" style={{ color: MUTED }}>{l}</div>)}
+  </div>
+);
+const Row = ({ k, v, ly, change, bold }) => (
+  <tr style={{ borderTop: "1px solid #EDE9DE" }}>
+    <td className="py-1.5 px-3" style={{ fontWeight: bold ? 700 : 400 }}>{k}</td>
+    <td className="py-1.5 px-3 text-right">{v}</td>
+    <td className="py-1.5 px-3 text-right" style={{ color: MUTED }}>{ly}</td>
+    <td className="py-1.5 px-3 text-right" style={{ color: MUTED }}>{change}</td>
+  </tr>
+);
+
+function OwnerDashboard({ dash, setDash, dailySales, liveInventory, dashGroups, getRow, overdueBalance, months, getAssumptions, openImport }) {
+  const today = dYMD(new Date());
+  const curMon = dMonday(today);
+  const liveFloor = dAdd(today, -58); // the app can see about 60 days of orders
+  const [weekStart, setWeekStart] = useState(dAdd(curMon, -7));
+  const [liveCache, setLiveCache] = useState({});
+  const [force, setForce] = useState(0);
+  const [showSettings, setShowSettings] = useState(false);
+  const [openCat, setOpenCat] = useState(null);
+  const [vendorSort, setVendorSort] = useState("sales");
+  const [vendorAll, setVendorAll] = useState(false);
+  const [showAllAlerts, setShowAllAlerts] = useState(false);
+  const [lyEdit, setLyEdit] = useState(false);
+  const settings = { ...DASH_DEFAULTS, ...(dash.settings || {}) };
+
+  const isWTD = weekStart === curMon;
+  const span = isWTD ? dDiff(weekStart, today) + 1 : 7;
+  const weekEnd = dAdd(weekStart, span - 1);
+  const lyOverride = (dash.lyOverrides || {})[weekStart];
+  const lyStart = lyOverride || dAdd(weekStart, -364);
+  const lyEnd = dAdd(lyStart, span - 1);
+  // Run rate for weeks of supply: the four most recent COMPLETE weeks ending at the one shown.
+  const rateEnd = isWTD ? dAdd(weekStart, -7) : weekStart;
+  const rateWeeks = [0, 1, 2, 3].map((i) => dAdd(rateEnd, -7 * i));
+
+  function savedDay(d) {
+    const x = (dash.dailyDetail || {})[d];
+    if (x) return x;
+    if (dailySales && dailySales[d] !== undefined) return { net: Number(dailySales[d]) };
+    return null;
+  }
+  function savedWeek(mon, kind) {
+    const w = (dash[kind] || {})[mon];
+    return w && w.days === 7 ? w : null;
+  }
+  function savedWeekComplete(mon) {
+    for (let i = 0; i < 7; i++) { const d = savedDay(dAdd(mon, i)); if (!d || typeof d.cogs !== "number" || typeof d.orders !== "number") return false; }
+    return !!(savedWeek(mon, "weeklyByType") && savedWeek(mon, "weeklyByVendor"));
+  }
+  const liveOf = (s, e) => { const x = liveCache[`${s}|${e}`]; return x && typeof x === "object" && !x.error ? x : null; };
+
+  // Fetch from Shopify only what isn't already saved, newest first, one at a time.
+  useEffect(() => {
+    const wants = [];
+    const want = (s, e, mustRefresh) => {
+      if (s < liveFloor) return;
+      const k = `${s}|${e}`;
+      if (!mustRefresh && liveCache[k]) return;
+      if (!mustRefresh && e < today && dDiff(s, e) === 6 && savedWeekComplete(s)) return;
+      if (!wants.some((w) => w[2] === k)) wants.push([s, e, k]);
+    };
+    want(weekStart, weekEnd, isWTD || force > 0);
+    rateWeeks.forEach((m) => want(m, dAdd(m, 6), false));
+    if (!wants.length) return;
+    let cancelled = false;
+    (async () => {
+      for (const [s, e, k] of wants) {
+        if (cancelled) return;
+        setLiveCache((p) => ({ ...p, [k]: "loading" }));
+        try {
+          const res = await fetch(`/week-summary?start=${s}&end=${e}`).then((r) => r.json());
+          setLiveCache((p) => ({ ...p, [k]: res }));
+          if (!res.error && e < today && dDiff(s, e) === 6) persistWeek(s, res);
+        } catch (err) { setLiveCache((p) => ({ ...p, [k]: { error: String(err.message || err) } })); }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [weekStart, force]);
+
+  // A finished week fetched live is saved, so the next visit is instant and the year-to-date fills
+  // itself in. Anything imported is never overwritten by a live figure.
+  function persistWeek(mon, res) {
+    const r2 = (v) => Math.round(v * 100) / 100;
+    const roundRows = (rows) => Object.fromEntries(Object.entries(rows || {}).map(([k, v]) => [k, { net: r2(v.net), units: r2(v.units), cogs: r2(v.cogs) }]));
+    setDash((prev) => {
+      const dd = { ...(prev.dailyDetail || {}) };
+      Object.entries(res.days || {}).forEach(([d, v]) => {
+        if (!dd[d] || dd[d].src === "live") dd[d] = { ...Object.fromEntries(DAY_FIELDS.map((f) => [f, r2(v[f] || 0)])), src: "live" };
+      });
+      const wt = { ...(prev.weeklyByType || {}) }, wv = { ...(prev.weeklyByVendor || {}) };
+      if (!wt[mon] || wt[mon].src === "live") wt[mon] = { days: 7, rows: roundRows(res.byType), src: "live", cogs: true, units: true };
+      if (!wv[mon] || wv[mon].src === "live") wv[mon] = { days: 7, rows: roundRows(res.byVendor), src: "live", cogs: true, units: true };
+      return { ...prev, dailyDetail: dd, weeklyByType: wt, weeklyByVendor: wv };
+    });
+  }
+  function setSetting(k, v) { setDash((p) => ({ ...p, settings: { ...(p.settings || {}), [k]: v === "" ? undefined : Number(v) } })); }
+  function setPayroll(v) { setDash((p) => { const pr = { ...(p.payroll || {}) }; if (v === "") delete pr[weekStart]; else pr[weekStart] = Number(v); return { ...p, payroll: pr }; }); }
+  function setLyOverride(v) { setDash((p) => { const o = { ...(p.lyOverrides || {}) }; if (!v) delete o[weekStart]; else o[weekStart] = dMonday(v); return { ...p, lyOverrides: o }; }); }
+
+  // ---------- this week ----------
+  const selLive = liveOf(weekStart, weekEnd);
+  const selLoading = liveCache[`${weekStart}|${weekEnd}`] === "loading";
+  const selError = (liveCache[`${weekStart}|${weekEnd}`] || {}).error;
+  let ty;
+  if (selLive) ty = { t: { ...selLive.totals, found: span, n: span, complete: true }, byType: normTypeRows(selLive.byType), byVendor: selLive.byVendor, source: "live", truncated: selLive.truncated };
+  else {
+    const t = sumDays(savedDay, weekStart, span);
+    ty = { t, byType: span === 7 ? normTypeRows(savedWeek(weekStart, "weeklyByType")?.rows) : null, byVendor: span === 7 ? savedWeek(weekStart, "weeklyByVendor")?.rows || null : null, source: t.found ? "saved" : "none" };
+  }
+  const tyR = ratios(ty.t);
+
+  // ---------- same week last year ----------
+  const lyT = sumDays(savedDay, lyStart, span);
+  const lyFull = span < 7 ? sumDays(savedDay, lyStart, 7) : lyT;
+  // A part week compares category and vendor splits by scaling LY's full week by the share of its
+  // sales that fell in the matching days - the only finer grain stored is store-wide.
+  const lyScale = span === 7 ? 1 : (lyT.complete && lyFull.complete && lyFull.net > 0 ? lyT.net / lyFull.net : null);
+  const lyWT = savedWeek(lyStart, "weeklyByType"), lyWV = savedWeek(lyStart, "weeklyByVendor");
+  const lyByType = lyWT ? scaleRows(normTypeRows(lyWT.rows), lyScale) : null;
+  const lyByVendor = lyWV ? scaleRows(lyWV.rows, lyScale) : null;
+  const lyR = ratios(lyT);
+  const lyOK = lyT.complete;
+
+  // ---------- year to date ----------
+  const yStart = `${weekEnd.slice(0, 4)}-01-01`;
+  const yN = dDiff(yStart, weekEnd) + 1;
+  const tyDay = (d) => (selLive && selLive.days && selLive.days[d]) || savedDay(d);
+  const ytd = sumDays(tyDay, yStart, yN);
+  const ytdLY = sumDays(savedDay, dAdd(yStart, -364), yN);
+  const ytdR = ratios(ytd), ytdLYR = ratios(ytdLY);
+  const ytdOK = ytd.complete && ytdLY.complete;
+
+  // ---------- stock ----------
+  const inv = liveInventory && liveInventory.totals ? liveInventory : null;
+  const stockDate = inv && inv.loadedAt ? dYMD(new Date(inv.loadedAt)) : null;
+  // Sell-through and weeks of supply set this week's selling against TODAY's stock, so they only
+  // mean something for a week close to the snapshot.
+  const stockFits = stockDate && dDiff(weekEnd, stockDate) <= 14 && dDiff(weekEnd, stockDate) >= -7;
+  const invTot = inv ? Object.values(inv.totals).reduce((a, x) => ({ value: a.value + (x.value || 0), units: a.units + (x.units || 0), retail: a.retail + (x.retail || 0) }), { value: 0, units: 0, retail: 0 }) : null;
+  const hasRetail = inv && inv.hasRetail;
+  const hist = dash.invHistory || [];
+  const lyInv = stockDate ? hist.find((h) => Math.abs(dDiff(h.date, dAdd(stockDate, -364))) <= 10) : null;
+
+  // ---------- 4-week run rate ----------
+  function weekRows(mon, kind) {
+    const l = liveOf(mon, dAdd(mon, 6));
+    if (l) return kind === "byType" ? normTypeRows(l.byType) : l.byVendor;
+    const w = savedWeek(mon, kind === "byType" ? "weeklyByType" : "weeklyByVendor");
+    return w ? (kind === "byType" ? normTypeRows(w.rows) : w.rows) : null;
+  }
+  const rateType = rateWeeks.map((m) => weekRows(m, "byType")).filter(Boolean);
+  const rateVendor = rateWeeks.map((m) => weekRows(m, "byVendor")).filter(Boolean);
+  const weeklyCogs = (types) => rateType.length ? rateType.reduce((a, w) => a + types.reduce((b, t) => b + (w[t]?.cogs || 0), 0), 0) / rateType.length : null;
+
+  // ---------- categories ----------
+  function onOrderFor(t) { return months.reduce((a, m) => a + num(getRow(t, m).balanceToReceive), 0) + overdueBalance(t); }
+  function metricsFor(types) {
+    const sum = (rows, f) => rows ? types.reduce((a, t) => a + (rows[t]?.[f] || 0), 0) : null;
+    const net = sum(ty.byType, "net"), units = sum(ty.byType, "units"), cogs = sum(ty.byType, "cogs");
+    const ly = sum(lyByType, "net");
+    const lyCogs = lyByType && lyWT && lyWT.cogs ? sum(lyByType, "cogs") : null;
+    const ic = inv ? types.reduce((a, t) => a + (inv.totals[t]?.value || 0), 0) : null;
+    const ir = inv && hasRetail ? types.reduce((a, t) => a + (inv.totals[t]?.retail || 0), 0) : null;
+    const rate = weeklyCogs(types);
+    return {
+      net, ly, chg: chg(net, ly), units, cogs, invCost: ic, invRetail: ir,
+      st: stockFits && cogs !== null && ic !== null && cogs + ic > 0 ? (cogs / (cogs + ic)) * 100 : null,
+      gm: net && cogs !== null ? ((net - cogs) / net) * 100 : null,
+      lyGm: ly && lyCogs !== null ? ((ly - lyCogs) / ly) * 100 : null,
+      onOrder: types.reduce((a, t) => a + onOrderFor(t), 0),
+      wos: stockFits && rate && ic !== null ? ic / rate : null,
+    };
+  }
+  const catRows = CATEGORIES.map((c) => ({ cat: c, types: TYPES_BY_CATEGORY[c] || [], ...metricsFor(TYPES_BY_CATEGORY[c] || []) }));
+  const otherTypes = ty.byType ? Object.keys(ty.byType).filter((t) => !CATEGORY_OF[t]) : [];
+  if (otherTypes.length) catRows.push({ cat: "Not in taxonomy", types: otherTypes, ...metricsFor(otherTypes) });
+
+  // ---------- vendors ----------
+  const vendorMap = {};
+  const touch = (name) => { const k = vkey(name); if (!vendorMap[k]) vendorMap[k] = { name, net: null, ly: null, units: null, cogs: null, invCost: null, onOrder: null, rate4: null, ly4: null }; return vendorMap[k]; };
+  Object.entries(ty.byVendor || {}).forEach(([v, r]) => { const o = touch(v); o.net = (o.net || 0) + r.net; o.units = (o.units || 0) + r.units; o.cogs = (o.cogs || 0) + r.cogs; });
+  Object.entries(lyByVendor || {}).forEach(([v, r]) => { const o = touch(v); o.ly = (o.ly || 0) + r.net; });
+  Object.entries((inv && inv.byVendor) || {}).forEach(([v, r]) => { const o = touch(v); o.invCost = (o.invCost || 0) + r.value; });
+  Object.entries(dash.poByVendor || {}).forEach(([v, amt]) => { const o = touch(v); o.onOrder = (o.onOrder || 0) + amt; });
+  // 4-week sales by vendor, this year and last, for the "stock up, sales down" check.
+  if (rateVendor.length === 4) {
+    const lyWeeks = rateWeeks.map((m) => savedWeek(dAdd(m, -364), "weeklyByVendor"));
+    if (lyWeeks.every(Boolean)) {
+      rateVendor.forEach((w) => Object.entries(w).forEach(([v, r]) => { const o = touch(v); o.rate4 = (o.rate4 || 0) + r.net; }));
+      lyWeeks.forEach((w) => Object.entries(w.rows).forEach(([v, r]) => { const o = touch(v); o.ly4 = (o.ly4 || 0) + r.net; }));
+    }
+  }
+  const vendorRows = Object.values(vendorMap).map((v) => ({
+    ...v, chg: chg(v.net, v.ly),
+    gm: v.net && v.cogs !== null ? ((v.net - v.cogs) / v.net) * 100 : null,
+    st: stockFits && v.cogs !== null && v.invCost !== null && v.cogs + v.invCost > 0 ? (v.cogs / (v.cogs + v.invCost)) * 100 : null,
+  }));
+  const sortKey = { sales: (v) => v.net ?? -1e9, st: (v) => v.st ?? -1e9, gm: (v) => v.gm ?? -1e9, inv: (v) => v.invCost ?? -1e9 }[vendorSort];
+  vendorRows.sort((a, b) => sortKey(b) - sortKey(a));
+
+  // ---------- buying ----------
+  const G = dashGroups || [];
+  const otb = {
+    planned: G.reduce((a, g) => a + Math.max(0, g.planned), 0),
+    received: G.reduce((a, g) => a + g.received, 0),
+    open: G.reduce((a, g) => a + g.open, 0),
+    canBuy: G.reduce((a, g) => a + Math.max(0, g.net), 0),
+    over: G.reduce((a, g) => a + Math.min(0, g.net), 0),
+    committed: G.reduce((a, g) => a + g.open + g.ahead.reduce((b, x) => b + x.amt, 0), 0),
+  };
+  const ahead = (G[0] ? G[0].ahead : []).map((x, i) => ({ m: x.m, amt: G.reduce((a, g) => a + (g.ahead[i]?.amt || 0), 0) }));
+
+  // ---------- payroll ----------
+  const payroll = (dash.payroll || {})[weekStart];
+  const payPct = payroll !== undefined && ty.t.net > 0 ? (payroll / ty.t.net) * 100 : null;
+  const payTone = payPct === null ? INK : payPct <= settings.payrollTarget ? GOOD : payPct <= settings.payrollWarn ? WARN : BAD;
+
+  // ---------- needs attention ----------
+  const alerts = [];
+  const A = (sev, title, detail) => alerts.push({ sev, title, detail });
+  const salesChg = lyOK ? chg(ty.t.net, lyT.net) : null;
+  if (salesChg !== null && salesChg <= -settings.salesWarn)
+    A(salesChg <= -settings.salesBad ? "red" : "yellow", `Sales ${fmtChg(salesChg)} vs last year`, `${money(ty.t.net)} against ${money(lyT.net)} ${isWTD ? "for the same days" : "for the same week"} last year.`);
+  const ytdChg = ytdOK ? chg(ytd.net, ytdLY.net) : null;
+  if (ytdChg !== null && ytdChg <= -settings.ytdWarn)
+    A(ytdChg <= -2 * settings.ytdWarn ? "red" : "yellow", `Year to date ${fmtChg(ytdChg)}`, `${money(ytd.net)} against ${money(ytdLY.net)} over the same ${yN} days last year.`);
+  const planGM = (() => { let w = 0, s = 0; catRows.forEach((c) => { if (c.net > 0 && CATEGORY_OF[c.types[0]]) { s += c.net * getAssumptions(c.cat).gmPct; w += c.net; } }); return w ? s / w : null; })();
+  const gmBase = lyOK && lyR.gm !== null ? lyR.gm : planGM;
+  const gmDrop = tyR.gm !== null && gmBase !== null ? gmBase - tyR.gm : null;
+  if (gmDrop !== null && gmDrop >= settings.gmWarn && ty.t.net >= settings.minSales)
+    A(gmDrop >= settings.gmBad ? "red" : "yellow", `Margin ${fmtPct(tyR.gm)}, down ${gmDrop.toFixed(1)} pts`, `Against ${fmtPct(gmBase)} ${lyOK && lyR.gm !== null ? "the same week last year" : "planned (GM % assumptions, weighted by this week's sales)"}.`);
+  if (payPct !== null && !isWTD && payPct > settings.payrollTarget)
+    A(payPct > settings.payrollWarn ? "red" : "yellow", `Payroll ${fmtPct(payPct)} of sales`, `${money(payroll)} on ${money(ty.t.net)} of sales; target is ${settings.payrollTarget}% or less.`);
+  if (tyR.disc !== null) {
+    const up = lyOK && lyR.disc !== null ? tyR.disc - lyR.disc : null;
+    if (tyR.disc >= settings.discWarn || (up !== null && up >= settings.discUpPts))
+      A(tyR.disc >= settings.discBad ? "red" : "yellow", `Discounts ${fmtPct(tyR.disc)} of gross sales`, `${money(ty.t.discounts)} given away${up !== null ? `, ${fmtPts(up)} vs last year` : ""}.`);
+  }
+  // One alert per slow category: weeks of supply and sell-through say the same thing two ways.
+  catRows.filter((c) => c.wos !== null && c.invCost >= settings.minInv && c.wos >= settings.wosWarn).sort((a, b) => b.invCost - a.invCost)
+    .forEach((c) => A(c.wos >= settings.wosBad ? "red" : "yellow", `${c.cat}: ${c.wos.toFixed(0)} weeks of stock`, `${money(c.invCost)} on hand selling ${money(c.invCost / c.wos)} a week at cost${c.st !== null ? `; ${fmtPct(c.st)} sold through this week` : ""}.`));
+  catRows.filter((c) => c.chg !== null && c.ly >= settings.minSales && c.chg <= -settings.catSalesWarn).sort((a, b) => a.chg - b.chg).slice(0, 3)
+    .forEach((c) => A("yellow", `${c.cat} sales ${fmtChg(c.chg)}`, `${money(c.net)} against ${money(c.ly)} last year.`));
+  const overGroups = G.filter((g) => g.net <= -settings.otbOverMin).sort((a, b) => a.net - b.net);
+  if (overGroups.length)
+    A("red", `Overbought in ${overGroups.length} group${overGroups.length === 1 ? "" : "s"} this month`, overGroups.slice(0, 4).map((g) => `${g.g} ${money(g.net)}`).join(", ") + (overGroups.length > 4 ? ", …" : "") + ". Past cover target at cost — nothing to buy there until it sells down.");
+  if (otb.planned > 0 && otb.canBuy < (settings.otbNearPct / 100) * otb.planned)
+    A("yellow", `Buying for ${monthLabel(months[0])} nearly used up`, `${money(otb.canBuy)} left of ${money(otb.planned)} planned receipts.`);
+  const heavy = G.filter((g) => g.next3Cogs > 0 && g.next3OnOrder >= settings.minInv && g.next3OnOrder / g.next3Cogs >= settings.commitRatio);
+  if (heavy.length)
+    A("yellow", `Heavy on order in ${heavy.length} group${heavy.length === 1 ? "" : "s"}`, heavy.slice(0, 4).map((g) => `${g.g} ${money(g.next3OnOrder)} vs ${money(g.next3Cogs)} selling`).join(", ") + " — landing over the next 3 months, at cost.");
+  const latest = hist.length ? hist[hist.length - 1] : null;
+  const older = latest ? [...hist].reverse().find((h) => dDiff(h.date, latest.date) >= 21 && h.byVendor) : null;
+  if (latest && latest.byVendor && older) {
+    vendorRows.forEach((v) => {
+      const cur = Object.entries(latest.byVendor).find(([k]) => vkey(k) === vkey(v.name))?.[1];
+      const was = Object.entries(older.byVendor).find(([k]) => vkey(k) === vkey(v.name))?.[1];
+      if (!cur || !was || cur < settings.minInv || v.rate4 === null || !v.ly4 || v.ly4 < settings.minSales) return;
+      const g = chg(cur, was), s = chg(v.rate4, v.ly4);
+      if (g >= settings.vendInvGrowth && s <= -settings.vendSalesDrop)
+        A("yellow", `${v.name}: stock up, sales down`, `Stock ${fmtChg(g)} since ${dLabel(older.date)}; last 4 weeks' sales ${fmtChg(s)} vs last year.`);
+    });
+  }
+  alerts.sort((a, b) => (a.sev === b.sev ? 0 : a.sev === "red" ? -1 : 1));
+
+  // What's missing, said plainly, so a short alert list is never mistaken for an all-clear.
+  const gaps = [];
+  if (!lyOK) gaps.push({ text: `No last-year sales for ${dRange(lyStart, lyEnd)} (${lyT.found} of ${span} days on file), so nothing this week is compared with last year.`, kind: "dailySales" });
+  else if (lyT.orders === null || lyT.cogs === null) gaps.push({ text: "Last year's daily file has net sales only — orders, units, discounts and cost need re-importing with those columns.", kind: "dailySales" });
+  if (!lyWT || !lyWV) gaps.push({ text: `No last-year split by ${[!lyWT && "product type", !lyWV && "vendor"].filter(Boolean).join(" or ")} for that week.`, kind: "salesBy" });
+  if (!ytd.complete) gaps.push({ text: `Year to date has ${ytd.found} of ${yN} days this year on file.`, kind: "dailySales" });
+  if (ytd.complete && !ytdLY.complete) gaps.push({ text: `Year to date has ${ytdLY.found} of ${yN} matching days last year on file.`, kind: "dailySales" });
+  if (!inv) gaps.push({ text: "No stock snapshot loaded.", kind: "stock" });
+  else if (!stockFits) gaps.push({ text: `Stock snapshot is from ${dLabel(stockDate, true)}, too far from this week for sell-through or weeks of supply.`, kind: "stock" });
+  if (ty.source === "none" && !selLoading) gaps.push({ text: weekStart < liveFloor ? "This week is older than the ~60 days Shopify lets the app see, and isn't in the imported files." : "No sales loaded for this week yet.", kind: weekStart < liveFloor ? "dailySales" : null });
+
+  // ---------- UI ----------
+  const salesTone = salesChg === null ? INK : salesChg <= -settings.salesBad ? BAD : salesChg <= -settings.salesWarn ? WARN : salesChg >= 5 ? GOOD : INK;
+  const gmTone = gmDrop === null ? INK : gmDrop >= settings.gmBad ? BAD : gmDrop >= settings.gmWarn ? WARN : gmDrop <= -1 ? GOOD : INK;
+  const sev = { red: { bg: "#FAEDE9", fg: BAD, dot: BAD }, yellow: { bg: "#FBF4E4", fg: "#7A5A16", dot: "#C99A3C" } };
+  const shownAlerts = showAllAlerts ? alerts : alerts.slice(0, 8);
+  const sourceNote = ty.source === "live" ? `Live from Shopify${ty.truncated ? " — very large week, some orders may be missing" : ""}` : ty.source === "saved" ? "From saved / imported data" : "";
+  const fmtV = (v, f) => (v === null || v === undefined ? "—" : f(v));
+
+  return (
+    <div className="px-4 sm:px-8 py-5" style={{ background: "#F7F4EC" }}>
+      {/* week selector */}
+      <div className="flex flex-wrap items-center gap-3 mb-1">
+        <button onClick={() => { setWeekStart(dAdd(weekStart, -7)); setForce(0); setLyEdit(false); }} className="p-1.5 rounded" style={{ background: "#20232B", color: "#EDE7DA" }} aria-label="Previous week"><Icon.chevronLeft /></button>
+        <div>
+          <div style={{ ...big, color: INK }} className="text-xl sm:text-2xl font-bold">{isWTD ? "Week to date" : "Week of"} {dRange(weekStart, weekEnd)}</div>
+          <div className="text-xs" style={{ color: MUTED }}>
+            Monday to Sunday{isWTD ? `, ${span} of 7 days so far — compared day for day` : ""}. Compared with {dRange(lyStart, lyEnd)}{lyOverride ? " (holiday override)" : ""}.{" "}
+            <button className="underline" onClick={() => setLyEdit((v) => !v)}>{lyEdit ? "Done" : "Change"}</button>
+          </div>
+        </div>
+        <button onClick={() => { setWeekStart(dAdd(weekStart, 7)); setForce(0); setLyEdit(false); }} disabled={isWTD} className="p-1.5 rounded disabled:opacity-30" style={{ background: "#20232B", color: "#EDE7DA" }} aria-label="Next week"><Icon.chevronRight /></button>
+        {weekStart !== dAdd(curMon, -7) && <button onClick={() => { setWeekStart(dAdd(curMon, -7)); setForce(0); }} className="text-xs px-2 py-1 rounded" style={{ background: "#E6E1D6" }}>Last full week</button>}
+        {!isWTD && <button onClick={() => { setWeekStart(curMon); setForce(0); }} className="text-xs px-2 py-1 rounded" style={{ background: "#E6E1D6" }}>This week so far</button>}
+        {weekStart >= liveFloor && <button onClick={() => { setLiveCache({}); setForce((f) => f + 1); }} className="text-xs px-2 py-1 rounded flex items-center gap-1" style={{ background: "#E6E1D6" }}><Icon.refresh /> Refresh from Shopify</button>}
+        <span className="text-xs" style={{ color: selError ? BAD : MUTED }}>{selLoading ? "Loading from Shopify…" : selError ? `Shopify: ${selError}` : sourceNote}</span>
+      </div>
+      {lyEdit && (
+        <div className="text-xs mb-3 mt-2 p-2 rounded flex flex-wrap items-center gap-2" style={{ background: "#FFFFFF", border: "1px solid #DCD5C4" }}>
+          For holiday weeks, compare with the last-year week containing:
+          <input type="date" value={lyOverride || ""} onChange={(e) => setLyOverride(e.target.value)} className="border rounded px-1 py-0.5" style={{ borderColor: "#DCD5C4" }} />
+          {lyOverride && <button className="underline" onClick={() => setLyOverride("")}>Back to 52 weeks earlier</button>}
+          <span style={{ color: MUTED }}>Saved for this week only.</span>
+        </div>
+      )}
+
+      {/* KPI cards */}
+      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 mt-4 mb-5">
+        <Kpi title="Sales" tone={salesTone} value={fmtV(ty.t.net, money)} lines={[lyOK ? `${fmtChg(salesChg)} vs ${money(lyT.net)} last year` : "no last-year figure", ytdOK ? `Year to date ${fmtChg(ytdChg)}` : null]} />
+        <Kpi title="Profit" tone={gmTone} value={fmtPct(tyR.gm)} lines={[tyR.gp !== null ? `${money(tyR.gp)} gross profit` : null, lyOK && lyR.gm !== null ? `${fmtPct(lyR.gm)} last year` : planGM !== null ? `${fmtPct(planGM)} planned` : null]} />
+        <Kpi title="Customers" value={fmtNum(ty.t.orders)} lines={[`${fmtV(tyR.atv, money)} average sale`, `${fmtV(tyR.upt, (x) => x.toFixed(2))} items per sale`, lyOK && lyT.orders !== null ? `${fmtNum(lyT.orders)} last year` : null]} />
+        <Kpi title="Inventory" value={invTot ? money(invTot.value) : "—"} lines={[invTot ? `${fmtNum(invTot.units)} units${hasRetail ? `, ${money(invTot.retail)} retail` : ""}` : null, stockFits && ty.t.cogs !== null && invTot ? `${fmtPct((ty.t.cogs / (ty.t.cogs + invTot.value)) * 100)} sold through this week` : null]} />
+        <Kpi title="Buying" tone={otb.canBuy > 0 ? INK : MUTED} value={money(otb.canBuy)} lines={[`left to buy for ${monthLabel(months[0])}`, `${money(otb.committed)} on order`, otb.over < 0 ? `${money(otb.over)} overbought elsewhere` : null]} />
+        <Kpi title="Payroll" tone={payTone} value={payroll !== undefined ? money(payroll) : "—"} lines={[payPct !== null ? `${fmtPct(payPct)} of sales${isWTD ? " so far" : ""}` : "enter it below", `target ${settings.payrollTarget}% or less`]} />
+      </div>
+
+      {/* needs attention */}
+      <div className="rounded-md p-4 mb-6" style={{ background: "#20232B" }}>
+        <div className="flex items-baseline justify-between flex-wrap gap-2 mb-2">
+          <div style={{ ...big, color: "#EDE7DA" }} className="text-lg font-bold">Needs attention</div>
+          <button onClick={() => setShowSettings((v) => !v)} className="text-xs px-2 py-1 rounded flex items-center gap-1" style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }}><Icon.sliders /> Thresholds</button>
+        </div>
+        {alerts.length === 0 ? (
+          <div className="text-sm" style={{ color: "#C7CCD6" }}>{gaps.length ? "Nothing flagged in the figures available — but see what's missing below." : "Nothing flagged this week."}</div>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {shownAlerts.map((a, i) => (
+              <div key={i} className="rounded px-3 py-2 flex gap-3" style={{ background: sev[a.sev].bg }}>
+                <span style={{ width: 8, height: 8, borderRadius: 4, background: sev[a.sev].dot, marginTop: 6, flexShrink: 0 }} />
+                <div><div className="text-sm font-semibold" style={{ color: sev[a.sev].fg }}>{a.title}</div><div className="text-xs" style={{ color: "#4A4F59" }}>{a.detail}</div></div>
+              </div>
+            ))}
+            {alerts.length > 8 && <button className="text-xs underline self-start" style={{ color: "#C7CCD6" }} onClick={() => setShowAllAlerts((v) => !v)}>{showAllAlerts ? "Show fewer" : `Show ${alerts.length - 8} more`}</button>}
+          </div>
+        )}
+        {gaps.length > 0 && (
+          <div className="mt-3 pt-3" style={{ borderTop: "1px solid #3A4150" }}>
+            <div className="text-xs mb-1" style={{ color: "#9AA0AC" }}>Missing data — these checks can't run until it's loaded:</div>
+            {gaps.map((g, i) => (
+              <div key={i} className="text-xs flex flex-wrap items-center gap-2 mb-1" style={{ color: "#C7CCD6" }}>
+                <span>{g.text}</span>
+                {g.kind && <button onClick={() => openImport(g.kind)} className="underline" style={{ color: "#D9B15C" }}>Import {IMPORT_KINDS[g.kind].label}</button>}
+              </div>
+            ))}
+          </div>
+        )}
+        {showSettings && (
+          <div className="mt-3 pt-3 grid sm:grid-cols-2 gap-x-6 gap-y-1.5" style={{ borderTop: "1px solid #3A4150" }}>
+            {DASH_SETTING_LABELS.map(([k, l, u]) => (
+              <label key={k} className="text-xs flex items-center justify-between gap-2" style={{ color: "#C7CCD6" }}>
+                <span>{l}</span>
+                <span className="flex items-center gap-1">
+                  <input type="number" step="any" value={(dash.settings || {})[k] ?? ""} placeholder={String(DASH_DEFAULTS[k])} onChange={(e) => setSetting(k, e.target.value)} className="w-20 text-right rounded px-1 py-0.5" style={{ background: "#2A303B", color: "#EDE7DA", border: "1px solid #3A4150" }} />
+                  <span style={{ width: 34, color: "#9AA0AC" }}>{u}</span>
+                </span>
+              </label>
+            ))}
+            <div className="text-xs sm:col-span-2" style={{ color: "#9AA0AC" }}>Blank means the default shown. Saved with the rest of the plan.</div>
+          </div>
+        )}
+      </div>
+
+      <div className="grid lg:grid-cols-2 gap-x-8">
+        <Section title={isWTD ? "Week to date" : "This week"} note="Net sales exclude gift cards. Returns are counted on the day they happen, and give back their cost.">
+          <div style={card} className="rounded-md overflow-x-auto">
+            <table className="w-full text-xs sm:text-sm" style={{ fontFamily: "'IBM Plex Mono', monospace", borderCollapse: "collapse" }}>
+              <thead><tr><th className="text-left py-2 px-3" style={th}></th><th className="text-right py-2 px-3" style={th}>This year</th><th className="text-right py-2 px-3" style={th}>Last year</th><th className="text-right py-2 px-3" style={th}>Change</th></tr></thead>
+              <tbody>
+                <Row k="Net sales" bold v={fmtV(ty.t.net, money)} ly={lyOK ? money(lyT.net) : "—"} change={fmtChg(lyOK ? chg(ty.t.net, lyT.net) : null)} />
+                <Row k="Gross sales" v={fmtV(ty.t.gross, money)} ly={lyOK ? fmtV(lyT.gross, money) : "—"} change={fmtChg(lyOK ? chg(ty.t.gross, lyT.gross) : null)} />
+                <Row k="Discounts" v={fmtV(ty.t.discounts, money)} ly={lyOK ? fmtV(lyT.discounts, money) : "—"} change={fmtChg(lyOK ? chg(ty.t.discounts, lyT.discounts) : null)} />
+                <Row k="Discount %" v={fmtPct(tyR.disc)} ly={lyOK ? fmtPct(lyR.disc) : "—"} change={lyOK && tyR.disc !== null && lyR.disc !== null ? fmtPts(tyR.disc - lyR.disc) : "—"} />
+                <Row k="Returns" v={fmtV(ty.t.returns, money)} ly={lyOK ? fmtV(lyT.returns, money) : "—"} change={fmtChg(lyOK ? chg(ty.t.returns, lyT.returns) : null)} />
+                <Row k="Cost of goods" v={fmtV(ty.t.cogs, money)} ly={lyOK ? fmtV(lyT.cogs, money) : "—"} change={fmtChg(lyOK ? chg(ty.t.cogs, lyT.cogs) : null)} />
+                <Row k="Gross profit" v={fmtV(tyR.gp, money)} ly={lyOK ? fmtV(lyR.gp, money) : "—"} change={fmtChg(lyOK ? chg(tyR.gp, lyR.gp) : null)} />
+                <Row k="Gross margin" bold v={fmtPct(tyR.gm)} ly={lyOK ? fmtPct(lyR.gm) : "—"} change={lyOK && tyR.gm !== null && lyR.gm !== null ? fmtPts(tyR.gm - lyR.gm) : "—"} />
+                <Row k="Transactions" v={fmtNum(ty.t.orders)} ly={lyOK ? fmtNum(lyT.orders) : "—"} change={fmtChg(lyOK ? chg(ty.t.orders, lyT.orders) : null)} />
+                <Row k="Average sale" v={fmtV(tyR.atv, fmtMoney2)} ly={lyOK ? fmtV(lyR.atv, fmtMoney2) : "—"} change={fmtChg(lyOK ? chg(tyR.atv, lyR.atv) : null)} />
+                <Row k="Units sold" v={fmtNum(ty.t.units)} ly={lyOK ? fmtNum(lyT.units) : "—"} change={fmtChg(lyOK ? chg(ty.t.units, lyT.units) : null)} />
+                <Row k="Items per sale" v={fmtV(tyR.upt, (x) => x.toFixed(2))} ly={lyOK ? fmtV(lyR.upt, (x) => x.toFixed(2)) : "—"} change={fmtChg(lyOK ? chg(tyR.upt, lyR.upt) : null)} />
+              </tbody>
+            </table>
+          </div>
+        </Section>
+
+        <Section title="Year to date" note={`1 Jan to ${dLabel(weekEnd, true)}, against the same ${yN} weekday-matched days last year.`}>
+          <div style={card} className="rounded-md overflow-x-auto">
+            <table className="w-full text-xs sm:text-sm" style={{ fontFamily: "'IBM Plex Mono', monospace", borderCollapse: "collapse" }}>
+              <thead><tr><th className="text-left py-2 px-3" style={th}></th><th className="text-right py-2 px-3" style={th}>This year</th><th className="text-right py-2 px-3" style={th}>Last year</th><th className="text-right py-2 px-3" style={th}>Change</th></tr></thead>
+              <tbody>
+                <Row k="Net sales" bold v={ytd.complete ? fmtV(ytd.net, money) : "—"} ly={ytdLY.complete ? fmtV(ytdLY.net, money) : "—"} change={fmtChg(ytdOK ? ytdChg : null)} />
+                <Row k="Gross profit" v={ytd.complete ? fmtV(ytdR.gp, money) : "—"} ly={ytdLY.complete ? fmtV(ytdLYR.gp, money) : "—"} change={fmtChg(ytdOK ? chg(ytdR.gp, ytdLYR.gp) : null)} />
+                <Row k="Gross margin" v={ytd.complete ? fmtPct(ytdR.gm) : "—"} ly={ytdLY.complete ? fmtPct(ytdLYR.gm) : "—"} change={ytdOK && ytdR.gm !== null && ytdLYR.gm !== null ? fmtPts(ytdR.gm - ytdLYR.gm) : "—"} />
+                <Row k="Units sold" v={ytd.complete ? fmtNum(ytd.units) : "—"} ly={ytdLY.complete ? fmtNum(ytdLY.units) : "—"} change={fmtChg(ytdOK ? chg(ytd.units, ytdLY.units) : null)} />
+                <Row k="Transactions" v={ytd.complete ? fmtNum(ytd.orders) : "—"} ly={ytdLY.complete ? fmtNum(ytdLY.orders) : "—"} change={fmtChg(ytdOK ? chg(ytd.orders, ytdLY.orders) : null)} />
+                <Row k="Average sale" v={ytd.complete ? fmtV(ytdR.atv, fmtMoney2) : "—"} ly={ytdLY.complete ? fmtV(ytdLYR.atv, fmtMoney2) : "—"} change={fmtChg(ytdOK ? chg(ytdR.atv, ytdLYR.atv) : null)} />
+                <Row k="Items per sale" v={ytd.complete ? fmtV(ytdR.upt, (x) => x.toFixed(2)) : "—"} ly={ytdLY.complete ? fmtV(ytdLYR.upt, (x) => x.toFixed(2)) : "—"} change={fmtChg(ytdOK ? chg(ytdR.upt, ytdLYR.upt) : null)} />
+              </tbody>
+            </table>
+          </div>
+          {!ytdOK && <p className="text-xs mt-2" style={{ color: MUTED }}>Shown once every day is on file: {ytd.found} of {yN} days this year, {ytdLY.found} of {yN} last year. Finished weeks fill in automatically as you view them; earlier dates come from the Daily Sales import.</p>}
+        </Section>
+
+        <Section title="Inventory" note={inv ? `Stock snapshot from ${dLabel(stockDate, true)}. Sell-through is this week's cost of goods ÷ (that + stock on hand), at cost.` : null}>
+          <div style={card} className="rounded-md p-4 grid grid-cols-2 sm:grid-cols-3 gap-4 text-sm">
+            {[
+              ["At cost", invTot ? money(invTot.value) : "—"],
+              ["At retail", invTot && hasRetail ? money(invTot.retail) : "—"],
+              ["Units on hand", invTot ? fmtNum(invTot.units) : "—"],
+              ["Sell-through, week", stockFits && invTot && ty.t.cogs !== null ? fmtPct((ty.t.cogs / (ty.t.cogs + invTot.value)) * 100) : "—"],
+              ["Weeks of supply", (() => { const r = weeklyCogs(TAXONOMY.map((t) => t[0])); return stockFits && invTot && r ? `${(invTot.value / r).toFixed(1)}` : "—"; })()],
+              ["vs last year", lyInv && invTot ? `${fmtChg(chg(invTot.value, lyInv.value))}` : "—"],
+            ].map(([k, v]) => <div key={k}><div style={label} className="text-[11px] uppercase tracking-wider">{k}</div><div style={{ ...big, color: INK }} className="text-xl font-bold">{v}</div></div>)}
+          </div>
+          <p className="text-xs mt-2" style={{ color: MUTED }}>
+            Weeks of supply uses the average of the last {rateType.length || 4} complete weeks' cost of goods{rateType.length < 4 ? ` (only ${rateType.length} available)` : ""}, so it reads steadier than Month Pace early in a month.
+            {!lyInv && ` Stock vs last year starts once a snapshot from a year earlier exists — history begins ${hist.length ? dLabel(hist[0].date, true) : "with your next stock import"}.`}
+            {inv && !hasRetail && " Re-import stock from a file with a price column for retail value."}
+          </p>
+        </Section>
+
+        <Section title={`Buying — ${monthLabel(months[0])}`} note="Same engine and settings as the Buy Board, by planning group. Planned receipts is what the month needs to land to reach cover; minus what's received and on order, the rest is what you can still buy. An overbought group never funds another group's buy.">
+          <div style={card} className="rounded-md p-4 grid grid-cols-2 sm:grid-cols-3 gap-4 text-sm mb-2">
+            {[
+              ["Planned receipts", money(otb.planned), INK],
+              ["Received", money(otb.received), INK],
+              ["Open POs this month", money(otb.open), INK],
+              ["Can still buy", money(otb.canBuy), otb.canBuy > 0 ? GOOD : MUTED],
+              ["Overbought", money(otb.over), otb.over < -settings.otbOverMin ? BAD : MUTED],
+              ["All on order", money(otb.committed), INK],
+            ].map(([k, v, c]) => <div key={k}><div style={label} className="text-[11px] uppercase tracking-wider">{k}</div><div style={{ ...big, color: c }} className="text-xl font-bold">{v}</div></div>)}
+          </div>
+          <div style={card} className="rounded-md overflow-x-auto">
+            <table className="w-full text-xs" style={{ fontFamily: "'IBM Plex Mono', monospace", borderCollapse: "collapse" }}>
+              <thead><tr>{["Group", "Planned", "Received", "Open POs", "Can buy", ...ahead.slice(0, 3).map((x) => monthLabel(x.m))].map((h, i) => <th key={h} className={`py-2 px-2 ${i ? "text-right" : "text-left"}`} style={th}>{h}</th>)}</tr></thead>
+              <tbody>
+                {G.filter((g) => g.planned || g.received || g.open || g.net).map((g) => (
+                  <tr key={g.g} style={{ borderTop: "1px solid #EDE9DE" }}>
+                    <td className="py-1.5 px-2">{g.g}</td>
+                    <td className="py-1.5 px-2 text-right">{money(Math.max(0, g.planned))}</td>
+                    <td className="py-1.5 px-2 text-right">{money(g.received)}</td>
+                    <td className="py-1.5 px-2 text-right">{money(g.open)}</td>
+                    <td className="py-1.5 px-2 text-right" style={{ color: g.net > 0 ? GOOD : g.net <= -settings.otbOverMin ? BAD : MUTED, fontWeight: 600 }}>{money(g.net)}</td>
+                    {g.ahead.slice(0, 3).map((x) => <td key={x.m} className="py-1.5 px-2 text-right" style={{ color: MUTED }}>{x.amt ? money(x.amt) : "—"}</td>)}
+                  </tr>
+                ))}
+                <tr style={{ borderTop: "2px solid #DCD5C4", fontWeight: 700 }}>
+                  <td className="py-1.5 px-2">Upcoming</td><td colSpan={4} className="py-1.5 px-2 text-right" style={{ color: MUTED, fontWeight: 400 }}>landing after {monthLabel(months[0])}, at cost →</td>
+                  {ahead.slice(0, 3).map((x) => <td key={x.m} className="py-1.5 px-2 text-right">{money(x.amt)}</td>)}
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          {ahead.length > 3 && <p className="text-xs mt-1" style={{ color: MUTED }}>Plus {money(ahead.slice(3).reduce((a, x) => a + x.amt, 0))} on order for {monthLabel(ahead[3].m)} onward. Red in "Can buy" is how far past cover target a group sits.</p>}
+        </Section>
+      </div>
+
+      <Section title="Payroll" note="Payroll for the same Monday–Sunday week. Saved per week.">
+        <div style={card} className="rounded-md p-4 flex flex-wrap items-end gap-6">
+          <label className="text-sm">
+            <div style={label} className="text-[11px] uppercase tracking-wider mb-1">Payroll cost, {dRange(weekStart, dAdd(weekStart, 6))}</div>
+            <input type="number" step="0.01" value={payroll ?? ""} onChange={(e) => setPayroll(e.target.value)} placeholder="0.00" className="border rounded px-2 py-1 w-40 text-right" style={{ borderColor: "#DCD5C4", fontFamily: "'IBM Plex Mono', monospace" }} />
+          </label>
+          <div><div style={label} className="text-[11px] uppercase tracking-wider">Of net sales</div><div style={{ ...big, color: payTone }} className="text-2xl font-bold">{fmtPct(payPct)}</div></div>
+          <div className="text-xs" style={{ color: MUTED }}>Green at or under {settings.payrollTarget}%, yellow to {settings.payrollWarn}%, red above. {isWTD ? "The week isn't finished, so this is against sales so far." : ""}</div>
+        </div>
+      </Section>
+
+      <Section title="Categories" note="Planning categories, this week against the same week last year. Tap a category for its product types. Sell-through and weeks of supply are at cost, against the current stock snapshot.">
+        <div style={card} className="rounded-md overflow-x-auto">
+          <table className="text-xs sm:text-sm" style={{ fontFamily: "'IBM Plex Mono', monospace", borderCollapse: "collapse", width: "max-content", minWidth: "100%" }}>
+            <thead><tr>{["Category", "Sales", "LY", "Change", "Units", "Stock cost", "Stock retail", "Sell-thru", "Margin", "On order", "Wks supply"].map((h, i) => <th key={h} className={`py-2 px-2 ${i ? "text-right" : "text-left"}`} style={{ ...th, ...(i === 0 ? { left: 0, zIndex: 3 } : {}) }}>{h}</th>)}</tr></thead>
+            <tbody>
+              {catRows.map((c) => {
+                const open = openCat === c.cat;
+                const line = (r, name, sub) => (
+                  <tr key={name} onClick={sub ? undefined : () => setOpenCat(open ? null : c.cat)} className={sub ? "" : "cursor-pointer"} style={{ borderTop: "1px solid #EDE9DE", background: sub ? "#FFFFFF" : "#FAF8F3" }}>
+                    <td className="py-1.5 px-2" style={{ position: "sticky", left: 0, background: sub ? "#FFFFFF" : "#FAF8F3", fontWeight: sub ? 400 : 600, paddingLeft: sub ? 22 : 8 }}>
+                      {!sub && <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 2, background: CATEGORY_COLOR[c.cat] || "#999", marginRight: 6 }} />}{name}
+                    </td>
+                    <td className="py-1.5 px-2 text-right">{fmtV(r.net, money)}</td>
+                    <td className="py-1.5 px-2 text-right" style={{ color: MUTED }}>{fmtV(r.ly, money)}</td>
+                    <td className="py-1.5 px-2 text-right" style={{ color: r.chg !== null && r.ly >= settings.minSales && r.chg <= -settings.catSalesWarn ? WARN : MUTED }}>{fmtChg(r.chg)}</td>
+                    <td className="py-1.5 px-2 text-right">{fmtNum(r.units)}</td>
+                    <td className="py-1.5 px-2 text-right">{fmtV(r.invCost, money)}</td>
+                    <td className="py-1.5 px-2 text-right" style={{ color: MUTED }}>{fmtV(r.invRetail, money)}</td>
+                    <td className="py-1.5 px-2 text-right">{fmtPct(r.st)}</td>
+                    <td className="py-1.5 px-2 text-right">{fmtPct(r.gm)}</td>
+                    <td className="py-1.5 px-2 text-right" style={{ color: MUTED }}>{r.onOrder ? money(r.onOrder) : "—"}</td>
+                    <td className="py-1.5 px-2 text-right" style={{ color: r.wos === null || r.invCost < settings.minInv ? INK : r.wos >= settings.wosBad ? BAD : r.wos >= settings.wosWarn ? WARN : INK, fontWeight: 600 }}>{r.wos === null ? "—" : r.wos > 99 ? "99+" : r.wos.toFixed(1)}</td>
+                  </tr>
+                );
+                return (
+                  <Fragment key={c.cat}>
+                    {line(c, c.cat, false)}
+                    {open && c.types.map((t) => line(metricsFor([t]), t, true))}
+                  </Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </Section>
+
+      <Section title="Vendors" note="On order by vendor comes from the PO import's Vendor column; stock by vendor from the stock import's Vendor column." right={
+        <div className="flex gap-1 text-xs">
+          {[["sales", "Sales"], ["st", "Sell-through"], ["gm", "Margin"], ["inv", "Stock $"]].map(([k, l]) => (
+            <button key={k} onClick={() => setVendorSort(k)} className="px-2 py-1 rounded" style={{ background: vendorSort === k ? "#C99A3C" : "#E6E1D6", color: INK, fontWeight: vendorSort === k ? 700 : 400 }}>{l}</button>
+          ))}
+        </div>}>
+        <div style={card} className="rounded-md overflow-x-auto">
+          <table className="text-xs sm:text-sm" style={{ fontFamily: "'IBM Plex Mono', monospace", borderCollapse: "collapse", width: "max-content", minWidth: "100%" }}>
+            <thead><tr>{["Vendor", "Sales", "LY", "Change", "Units", "Margin", "Stock cost", "Sell-thru", "On order"].map((h, i) => <th key={h} className={`py-2 px-2 ${i ? "text-right" : "text-left"}`} style={{ ...th, ...(i === 0 ? { left: 0, zIndex: 3 } : {}) }}>{h}</th>)}</tr></thead>
+            <tbody>
+              {(vendorAll ? vendorRows : vendorRows.slice(0, 25)).map((v) => (
+                <tr key={vkey(v.name)} style={{ borderTop: "1px solid #EDE9DE" }}>
+                  <td className="py-1.5 px-2" style={{ position: "sticky", left: 0, background: "#FFFFFF" }}>{v.name}</td>
+                  <td className="py-1.5 px-2 text-right">{fmtV(v.net, money)}</td>
+                  <td className="py-1.5 px-2 text-right" style={{ color: MUTED }}>{fmtV(v.ly, money)}</td>
+                  <td className="py-1.5 px-2 text-right" style={{ color: MUTED }}>{fmtChg(v.chg)}</td>
+                  <td className="py-1.5 px-2 text-right">{fmtNum(v.units)}</td>
+                  <td className="py-1.5 px-2 text-right">{fmtPct(v.gm)}</td>
+                  <td className="py-1.5 px-2 text-right">{fmtV(v.invCost, money)}</td>
+                  <td className="py-1.5 px-2 text-right">{fmtPct(v.st)}</td>
+                  <td className="py-1.5 px-2 text-right" style={{ color: MUTED }}>{fmtV(v.onOrder, money)}</td>
+                </tr>
+              ))}
+              {!vendorRows.length && <tr><td colSpan={9} className="py-3 px-3" style={{ color: MUTED }}>No vendor figures for this week yet.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        {vendorRows.length > 25 && <button className="text-xs underline mt-1" onClick={() => setVendorAll((v) => !v)}>{vendorAll ? "Show top 25" : `Show all ${vendorRows.length}`}</button>}
+      </Section>
     </div>
   );
 }
