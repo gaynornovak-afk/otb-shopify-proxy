@@ -28,6 +28,51 @@
 <div id="root"></div>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef, Fragment } = React;
+
+// Every call to this app's own server carries the password saved on this device. A 401 anywhere
+// raises "otb-locked", which stops autosave and shows the password screen - so a device without
+// the password can never write its own (possibly stale) copy over the real data.
+const KEY_STORE = "otb-key";
+(function () {
+  const orig = window.fetch.bind(window);
+  window.fetch = (url, opts = {}) => {
+    if (typeof url === "string" && url.startsWith("/")) {
+      let k = "";
+      try { k = localStorage.getItem(KEY_STORE) || ""; } catch (e) {}
+      if (k) opts = { ...opts, headers: { ...(opts.headers || {}), "x-otb-key": k } };
+      return orig(url, opts).then((r) => {
+        if (r.status === 401 || r.status === 429) window.dispatchEvent(new CustomEvent("otb-locked", { detail: r.status }));
+        return r;
+      });
+    }
+    return orig(url, opts);
+  };
+})();
+
+function LockScreen({ status }) {
+  const [pw, setPw] = useState("");
+  let had = false;
+  try { had = !!localStorage.getItem(KEY_STORE); } catch (e) {}
+  function unlock() {
+    if (!pw) return;
+    try { localStorage.setItem(KEY_STORE, pw); } catch (e) {}
+    window.location.reload();
+  }
+  return (
+    <div className="min-h-screen flex items-center justify-center p-4" style={{ background: "#20232B" }}>
+      <div className="w-full max-w-sm rounded-md p-6" style={{ background: "#FFFFFF" }}>
+        <div style={{ fontFamily: "'Roboto Slab', serif" }} className="text-xl font-bold mb-1">OTB Engine</div>
+        <p className="text-sm mb-4" style={{ color: "#5C6270" }}>Enter the password to open the planner. This device will remember it.</p>
+        <input type="password" autoFocus value={pw} onChange={(e) => setPw(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") unlock(); }}
+          className="w-full border rounded px-3 py-2 mb-3" style={{ borderColor: "#DCD5C4" }} aria-label="Password" />
+        {status === 429
+          ? <p className="text-xs mb-3" style={{ color: "#B5432D" }}>Too many wrong passwords from this connection. Wait 15 minutes, then try again.</p>
+          : had && <p className="text-xs mb-3" style={{ color: "#B5432D" }}>That password didn't work. Check it against STATE_PASSWORD in Render.</p>}
+        <button onClick={unlock} disabled={!pw} className="w-full text-sm px-3 py-2 rounded disabled:opacity-40" style={{ background: "#C99A3C", color: "#20232B", fontWeight: 600 }}>Unlock</button>
+      </div>
+    </div>
+  );
+}
 const Papa = window.Papa;
 
 const SWATCHES = ["#C99A3C", "#B5432D", "#5B7A5B", "#4A6280", "#7A5580", "#8C6E4A", "#5C8A8A", "#9C5B7A", "#6B7A3A", "#3A6B7A", "#8A6B3A", "#7A3A5B", "#4A5B7A"];
@@ -35,7 +80,7 @@ const CATW = 128, TYPEW = 220;
 const STORAGE_KEY = "otb-engine-v4";
 // Bump on every deploy. Shown in the header so "is this the build I just pushed?"
 // is answerable at a glance instead of by hunting for a changed control.
-const APP_VERSION = "v16.1";
+const APP_VERSION = "v16.2";
 
 // The five CSV formats the Import dialog accepts. Each import is now CHOSEN by name before a
 // file is loaded, not guessed afterwards: the chooser sets importLock, and parseAndPreview
@@ -346,6 +391,12 @@ function OTBEngine() {
   // payPeriods {endSunday: {start, end, cost, gross, employerTax, people, src}} (1- or 2-week periods),
   // settings (alert thresholds), lyOverrides {monday: LY monday}.
   const [dash, setDash] = useState({});
+  const [locked, setLocked] = useState(null); // null = open; 401/429 = password needed
+  useEffect(() => {
+    const onLock = (e) => setLocked(e.detail || 401);
+    window.addEventListener("otb-locked", onLock);
+    return () => window.removeEventListener("otb-locked", onLock);
+  }, []);
   const [payEnd, setPayEnd] = useState("");   // payroll import: last day (Sunday) of the pay period
   const [payWeeks, setPayWeeks] = useState(2); // payroll import: period length in weeks
   // --- Buy Board -------------------------------------------------------------
@@ -390,7 +441,11 @@ function OTBEngine() {
     (async () => {
       let loadedFromServer = false;
       try {
-        const res = await fetch("/state").then((r) => r.json());
+        const raw = await fetch("/state");
+        // Locked out: load NOTHING - not even this browser's local copy - so nothing stale can be
+        // shown, edited, or saved back over the real data once the password goes in.
+        if (raw.status === 401 || raw.status === 429) { setLocked(raw.status); return; }
+        const res = await raw.json();
         if (res.error) throw new Error(res.error);
         if (res.value) {
           const parsed = JSON.parse(res.value);
@@ -432,7 +487,7 @@ function OTBEngine() {
   }, []);
 
   useEffect(() => {
-    if (!loaded) return;
+    if (!loaded || locked) return;
     setSaveState("saving");
     const t = setTimeout(async () => {
       const payload = { assumptions, startingBOM, data, dailySales, planGroups, liveInventory, coverOverride, useTrend, skippedMonths, dash };
@@ -445,7 +500,7 @@ function OTBEngine() {
       } catch (e) { setSaveState("saved locally only"); }
     }, 400);
     return () => clearTimeout(t);
-  }, [assumptions, startingBOM, data, dailySales, planGroups, liveInventory, coverOverride, useTrend, skippedMonths, dash, loaded]);
+  }, [assumptions, startingBOM, data, dailySales, planGroups, liveInventory, coverOverride, useTrend, skippedMonths, dash, loaded, locked]);
 
   function getAssumptions(cat) { return assumptions[cat] || defaultAssumptions(); }
   function setAssumption(cat, patch) { setAssumptions((prev) => ({ ...prev, [cat]: { ...getAssumptions(cat), ...patch } })); }
@@ -1763,6 +1818,7 @@ function OTBEngine() {
     setSyncStatus(`Cleared ${cleared} stray BOM override(s).`);
   }
 
+  if (locked) return <LockScreen status={locked} />;
   if (!loaded) {
     return <div style={{ background: "#1B2027", minHeight: "100vh" }} className="flex items-center justify-center"><div style={{ color: "#EDE7DA", fontFamily: "'IBM Plex Mono', monospace" }}>Loading engine…</div></div>;
   }
