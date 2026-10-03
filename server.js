@@ -37,6 +37,36 @@ const app = express();
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.static(require("path").join(__dirname, "public")));
 
+// ---- Password on the data -------------------------------------------------------------------
+// The page itself is public (the code is on GitHub anyway); the DATA is not. Every endpoint that
+// returns or changes business data needs the header x-otb-key to match STATE_PASSWORD, which is
+// set in Render's Environment settings and nowhere else. If STATE_PASSWORD isn't set, everything
+// stays open exactly as before, so deploying this before adding the variable breaks nothing.
+const crypto = require("crypto");
+const STATE_PASSWORD = process.env.STATE_PASSWORD || "";
+if (!STATE_PASSWORD) console.warn("STATE_PASSWORD is not set - /state and the sales endpoints are open to anyone with the URL.");
+const failedTries = new Map(); // ip -> { count, first }
+const LOCKOUT_TRIES = 10, LOCKOUT_MS = 15 * 60 * 1000;
+function requirePassword(req, res, next) {
+  if (!STATE_PASSWORD) return next();
+  const ip = String(req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim();
+  const now = Date.now();
+  const f = failedTries.get(ip);
+  if (f && now - f.first >= LOCKOUT_MS) failedTries.delete(ip);
+  const cur = failedTries.get(ip);
+  if (cur && cur.count >= LOCKOUT_TRIES) return res.status(429).json({ error: "Too many wrong passwords. Try again in 15 minutes." });
+  const given = String(req.headers["x-otb-key"] || "");
+  // Compare hashes so the check takes the same time whatever was typed.
+  const a = crypto.createHash("sha256").update(given).digest();
+  const b = crypto.createHash("sha256").update(STATE_PASSWORD).digest();
+  if (given && crypto.timingSafeEqual(a, b)) { failedTries.delete(ip); return next(); }
+  if (given) { // a request with no password at all isn't a guess - don't count it toward the lockout
+    if (cur) cur.count++; else failedTries.set(ip, { count: 1, first: now });
+  }
+  return res.status(401).json({ error: "Password required." });
+}
+app.use(["/state", "/sales-by-type", "/vendor-report", "/inventory-by-type", "/line-items", "/week-summary"], requirePassword);
+
 async function shopifyGraphQL(query, variables, retries = 5) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     const res = await fetch(`https://${STORE}/admin/api/${API_VERSION}/graphql.json`, {
